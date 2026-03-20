@@ -66,6 +66,16 @@ Send a sticker or GIF in Telegram and Claude actually sees it. Static stickers a
 - Sticker emoji and pack name are included in the notification text for extra context
 - Uses `ffmpeg` for frame extraction and collage stitching — falls back gracefully if unavailable
 
+### Conversation threading for group chats
+In group chats, multiple conversations happen simultaneously. Without threading, Claude sees a flat stream of messages with no context. Now it can follow and participate in threaded conversations.
+
+- **Reply context forwarding** — when someone replies to a message, Claude sees the original text and sender (`reply_to_text`, `reply_to_user`)
+- **Thread chain tracking** — in-memory tracker maintains up to 200 messages per chat (4-hour TTL), walking reply chains up to 3 levels deep
+- **Auto-threaded replies** — Claude's responses include the thread context so it can reply to the correct message
+- **Forum topic support** — Telegram supergroup topics (`message_thread_id`) are forwarded as `thread_id` and passed through to replies, keeping conversations in their correct topic
+- **Bot message tracking** — bot's own sent messages are tracked so reply chains work when users reply to the bot
+- Zero persistence needed — in-memory only, bounded and self-pruning
+
 ### Emoji reaction validation
 The official plugin passes any emoji to Telegram's `setMessageReaction` API, which silently rejects non-whitelisted emoji with a cryptic `REACTION_INVALID` error. We added client-side validation.
 
@@ -86,11 +96,11 @@ Here's what we're planning to build. PRs welcome!
 - [x] **Voice & audio messages** - Download and transcribe voice messages using local open-source tools
 - [x] **Sticker & GIF support** - Download stickers and GIFs, convert to frame collages so Claude can see them
 - [x] **Emoji reaction validation** - Client-side whitelist prevents cryptic REACTION_INVALID errors
+- [x] **Conversation threading** - Smart thread management for group chats with reply context and Forum topic support
 
 ### Planned
 
 - [ ] **Message history buffer** - Keep a rolling buffer of recent messages so Claude has context without asking users to repeat themselves
-- [ ] **Conversation threading** - Smart thread management for group chats
 - [ ] **Scheduled messages** - Send messages at a specific time
 - [ ] **Multi-bot support** - Run multiple bots from one server instance
 - [ ] **Rate limiting & usage stats** - Track token usage and set limits per user
