@@ -344,7 +344,7 @@ const mcp = new Server(
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions: [
-      'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
+      'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat. IMPORTANT: When a Telegram message asks you to do something (write a post, generate code, answer a question), ALWAYS send the full result back via the reply tool. Never just acknowledge the request — deliver the actual content to Telegram. The user may only be reading Telegram, not your terminal.',
       '',
       'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
