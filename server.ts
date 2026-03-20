@@ -211,16 +211,18 @@ class MessageStore {
         thread_id       INTEGER,
         UNIQUE(chat_id, message_id)
       );
+    `);
+    // Migrate: add thread_id column to existing databases (must run BEFORE index creation).
+    const cols = this.db.query("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "thread_id")) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN thread_id INTEGER");
+    }
+    this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_messages_chat_date ON messages(chat_id, date DESC);
       CREATE INDEX IF NOT EXISTS idx_messages_chat_reply ON messages(chat_id, reply_to_msg_id) WHERE reply_to_msg_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);
       CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(chat_id, thread_id) WHERE thread_id IS NOT NULL;
     `);
-    // Migrate: add thread_id column to existing databases.
-    const cols = this.db.query("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
-    if (!cols.some((c) => c.name === "thread_id")) {
-      this.db.exec("ALTER TABLE messages ADD COLUMN thread_id INTEGER");
-    }
   }
 
   store(msg: {
