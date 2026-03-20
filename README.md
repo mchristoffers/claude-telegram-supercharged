@@ -132,7 +132,7 @@ Then restart your Claude Code session.
 | --- | --- |
 | **MarkdownV2 Formatting** | Bold, italic, code, and links render properly in Telegram instead of showing raw characters |
 | **Conversation Threading** | Smart thread management for group chats with reply context, chain tracking, and Forum topic support |
-| **Voice & Audio Messages** | Receive and process voice messages and audio files with optional Whisper transcription |
+| **Voice & Audio Messages** | Receive voice messages and audio files with automatic whisper transcription built into the server |
 | **Sticker & GIF Support** | Static stickers passed as images; animated stickers and GIFs converted to multi-frame collages |
 | **Ask User (Inline Buttons)** | Send questions with tappable inline keyboard buttons and wait for the user's choice |
 | **Emoji Reaction Tracking** | Claude receives and acts on user reactions as lightweight feedback |
@@ -159,7 +159,7 @@ Then restart your Claude Code session.
 | Text message | Forwarded to Claude as a channel notification with `chat_id`, `message_id`, `user`, `ts`. |
 | Photo | Downloaded to inbox, path included in notification so Claude can `Read` it. |
 | Emoji reaction | When a user reacts to a bot message, Claude receives a notification with `event_type: "reaction"`, the emoji, and the `message_id`. Use as lightweight feedback. |
-| Voice message | Downloaded to inbox as `.ogg`, path included in notification as `audio_path`. Claude transcribes using local whisper if available. |
+| Voice message | Downloaded to inbox as `.ogg`, auto-transcribed by the server if whisper is installed. Transcription replaces "(voice message)" in the notification text. Audio path still included as `audio_path`. |
 | Audio file | Forwarded audio files (`.mp3`, etc.) downloaded to inbox, path included as `audio_path`. |
 | Sticker | Static `.webp` passed directly as `image_path`. Animated (`.tgs`) and video (`.webm`) stickers converted to multi-frame collage. Emoji and pack name included in text. |
 | GIF / Animation | Downloaded and converted to a multi-frame horizontal collage so Claude can see the animation content. |
@@ -172,11 +172,23 @@ Inbound photos are downloaded to `~/.claude/channels/telegram/inbox/` and the lo
 
 ## Voice & Audio Messages
 
-Voice messages and audio files are downloaded to `~/.claude/channels/telegram/inbox/` and the path is included as `audio_path` in the notification. Claude will attempt to transcribe using locally installed tools:
+Voice messages and audio files are downloaded to `~/.claude/channels/telegram/inbox/` and automatically transcribed by the server. The transcription text replaces "(voice message)" in the notification, so Claude receives the spoken text directly.
 
-1. **[openai-whisper](https://github.com/openai/whisper)** (recommended) -- `pip install openai-whisper`. Supports 99 languages, runs fully offline.
-2. **ffmpeg only** -- if whisper isn't installed but ffmpeg is, Claude converts to `.wav` for manual review.
-3. **No tools** -- Claude tells you the voice was received and suggests installing whisper.
+### Transcription Setup
+
+The server auto-detects which whisper binary is available (checked once at startup):
+
+1. **[whisper.cpp](https://github.com/ggml-org/whisper.cpp)** (recommended) -- `brew install whisper-cpp`. Fast C++ port, runs fully offline. Requires a model file:
+   ```sh
+   # Download the small multilingual model (465MB, good quality/speed balance)
+   mkdir -p /usr/local/share/whisper-cpp/models
+   curl -L -o /usr/local/share/whisper-cpp/models/ggml-small.bin \
+     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+   ```
+2. **[openai-whisper](https://github.com/openai/whisper)** (fallback) -- `pip install openai-whisper`. Python-based, slower but also works offline.
+3. **No whisper** -- voice messages are still downloaded and the `audio_path` is included in the notification, but no transcription is provided. Claude will suggest installing whisper.
+
+Both options require **ffmpeg** (`brew install ffmpeg`) for audio format conversion.
 
 ## Group Chats & Conversation Threading
 
@@ -354,11 +366,15 @@ Beyond status, Claude also reacts expressively when a message genuinely stands o
 
 <br />
 
-Send a voice message or audio file in Telegram and Claude receives it. Voice messages and audio files are downloaded to the inbox and the path is passed to Claude via `audio_path` in the notification metadata.
+Send a voice message or audio file in Telegram and Claude receives the transcription directly. The server handles transcription automatically — no shell commands needed from Claude.
 
 - Supports both voice messages (recorded in-app, `.ogg`) and audio files (forwarded `.mp3`, etc.)
 - Downloaded eagerly to `~/.claude/channels/telegram/inbox/` like photos
-- Claude can process the audio file using available tools (transcription, analysis, etc.)
+- **Auto-transcription**: server detects `whisper-cli` (whisper.cpp) or `whisper` (openai-whisper) at startup and transcribes every voice/audio message
+- Transcription text replaces "(voice message)" in the notification content — Claude gets spoken text, not just a file path
+- Audio path still included as `audio_path` in metadata for further processing if needed
+- Language auto-detected (supports 99 languages via whisper models)
+- Graceful fallback: if no whisper is installed, the audio file is still delivered without transcription
 
 </details>
 
