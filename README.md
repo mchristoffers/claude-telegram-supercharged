@@ -48,6 +48,7 @@ Drop-in upgrade for the [official Claude Code Telegram plugin](https://github.co
 | **👥 Group Pairing** | Add bot to group, mention it, get pairing code. No hunting for numeric chat IDs. |
 | **🔒 Shell Injection Protection** | All subprocess calls use `spawnSync` with array args. No shell interpretation of file paths. |
 | **🧹 Session Management** | `clear_history` + `save_memory` tools. Clean up with context preservation. |
+| **🔄 Daemon Mode** | Supervisor script auto-restarts Claude on crash or context reset. Say "clear everything" in Telegram and Claude restarts with a fresh session -- memory preserved, zero downtime. |
 | **📊 Smart Caching** | Voice/audio files cached between middleware and handlers. No double downloads, no double transcriptions. |
 
 ## Getting Started
@@ -100,6 +101,12 @@ The server won't connect without this -- exit your session and start a new one:
 claude --channels plugin:telegram@claude-plugins-official
 ```
 
+Or use the **daemon supervisor** for always-on operation with auto-restart (see [Daemon Mode](#daemon-mode)):
+
+```sh
+bun supervisor.ts
+```
+
 ### 6. Pair
 
 With Claude Code running from the previous step, DM your bot on Telegram -- it replies with a 6-character pairing code. If the bot doesn't respond, make sure your session is running with `--channels`. In your Claude Code session:
@@ -138,7 +145,7 @@ Then restart your Claude Code session.
 | `ask_user` | Send a question with inline keyboard buttons and wait for the user's choice. Takes `chat_id`, `text`, `buttons` (array of labels), optional `parse_mode` and `timeout` (default 120s). Returns the label of the tapped button. |
 | `get_history` | Retrieve recent message history from a chat. Takes `chat_id`, optional `limit` (default 50, max 200), optional `before` (unix timestamp for pagination). Returns formatted messages with timestamps, senders, and content. |
 | `search_messages` | Search message history by text pattern. Takes `chat_id`, `query` (substring match), optional `limit` (default 20, max 100). Returns matching messages. |
-| `clear_history` | Clear all message history for a chat. Always confirm with `ask_user` first, and call `save_memory` before clearing to preserve context. |
+| `clear_history` | Clear all message history for a chat. Always confirm with `ask_user` first, and call `save_memory` before clearing to preserve context. Pass `restart_context: true` to signal the supervisor daemon to restart Claude for a full context reset. |
 | `save_memory` | Save a conversation summary to persistent memory. Loaded into Claude's instructions on every startup. Use before `clear_history` so context survives across sessions. |
 
 ### Inbound Events
@@ -200,6 +207,50 @@ When you clear chat history, Claude first saves a short summary to `~/.claude/ch
 - Summaries are dated and tagged with the chat ID
 - File auto-compresses when it exceeds 10,000 characters (older half gets trimmed)
 - Works across `/clear` and Claude Code restarts
+
+## Daemon Mode
+
+The plugin ships with a **supervisor script** (`supervisor.ts`) that runs Claude Code as a managed child process. It handles:
+
+- **Auto-restart on crash** -- exponential backoff (1s, 2s, 4s... up to 30s), resets after 60s of stable uptime
+- **Context reset from Telegram** -- say "clear everything" in Telegram, Claude saves memory, clears history, and the supervisor restarts Claude with a fresh session. Zero downtime, memory preserved.
+- **Signal file protocol** -- the MCP server writes `~/.claude/channels/telegram/data/restart.signal`, the supervisor detects it within 500ms, waits 3 seconds for Claude to finish sending replies, then kills and respawns
+
+### Usage
+
+Copy the supervisor to a convenient location (or run it from the cloned repo):
+
+```sh
+# From the cloned repo:
+bun supervisor.ts
+
+# Or copy it alongside your scripts:
+cp supervisor.ts ~/.claude/scripts/telegram-supervisor.ts
+bun ~/.claude/scripts/telegram-supervisor.ts
+```
+
+Extra flags are forwarded to Claude:
+
+```sh
+bun supervisor.ts --effort high
+```
+
+The supervisor spawns Claude with `--channels plugin:telegram@claude-plugins-official --dangerously-skip-permissions` by default.
+
+### How context reset works
+
+1. User sends "clear everything" in Telegram
+2. Claude confirms via inline buttons (`ask_user`)
+3. Claude saves a conversation summary (`save_memory`)
+4. Claude sends a confirmation reply to Telegram
+5. Claude calls `clear_history` with `restart_context: true`
+6. The MCP server writes `restart.signal` with a 3-second delay
+7. Supervisor detects the file, waits for Claude to finish, then kills the process
+8. Supervisor spawns a fresh Claude session -- memory.md is loaded into instructions automatically
+
+### Always-on with launchd (macOS)
+
+For a truly persistent setup, create `~/Library/LaunchAgents/com.user.claude-telegram.plist` and load with `launchctl load`.
 
 ## Group Chats & Conversation Threading
 
@@ -305,8 +356,9 @@ Photos and voice messages are downloaded eagerly on arrival -- there's no way to
 - [x] Shell injection protection (spawnSync)
 - [x] Smart media caching (no double downloads)
 
+- [x] Daemon mode supervisor (auto-restart + context reset from Telegram)
+
 ### Planned
-- [ ] **Daemon mode wrapper** -- tmux + systemd auto-reconnect for always-on operation
 - [ ] **Remote permission approval** -- Approve Claude Code permission prompts via Telegram inline buttons
 - [ ] **Scheduled messages** -- Send messages at a specific time
 - [ ] **Multi-bot support** -- Run multiple bots from one server instance

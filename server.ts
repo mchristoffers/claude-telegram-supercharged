@@ -764,7 +764,7 @@ const mcp = new Server(
       "",
       "EXPRESSIVE REACTIONS: Beyond status, react to messages that genuinely stand out — but be selective, not every message deserves one. Use your judgment: 🔥 for impressive work or exciting news, 😂 for genuinely funny messages, ❤ for heartfelt or kind messages, 🤔 for thought-provoking questions, 🎉 for celebrations or milestones, 👍 for solid ideas. Expressive reactions go on the user's message BEFORE or INSTEAD of the 👀 status reaction. Don't overdo it — if you react expressively to everything, it loses meaning.",
       "",
-      "SESSION MANAGEMENT: Use clear_history to wipe a chat's message history. Before clearing, ALWAYS: (1) use ask_user to confirm with the user, (2) call get_history to retrieve recent messages, (3) write a 2-3 sentence summary of the conversation, (4) call save_memory with the summary so context persists across clears. After saving memory, call clear_history. If the user wants a full context reset, also run /clear after.",
+      "SESSION MANAGEMENT: Use clear_history to wipe a chat's message history. Before clearing, ALWAYS: (1) use ask_user to confirm with the user, (2) call get_history to retrieve recent messages, (3) write a 2-3 sentence summary of the conversation, (4) call save_memory with the summary so context persists across clears. (5) Send a Telegram reply confirming the reset. (6) THEN call clear_history. If the user wants a full context reset (clear both history AND conversation context), pass restart_context: true to clear_history — this signals the supervisor daemon to restart Claude for a fresh session. IMPORTANT: Send the Telegram confirmation reply BEFORE calling clear_history with restart_context, because the process will be killed ~3 seconds after the signal is written.",
       "",
       ...(readMemory() ? ["CONVERSATION MEMORY (summaries from previous sessions):", readMemory()] : []),
     ].join("\n"),
@@ -919,13 +919,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "clear_history",
       description:
-        "Clear message history for a Telegram chat. IMPORTANT: Before calling this, always (1) confirm via ask_user, (2) get_history to read recent messages, (3) save_memory with a summary. Returns the number of deleted messages.",
+        "Clear message history for a Telegram chat. IMPORTANT: Before calling this, always (1) confirm via ask_user, (2) get_history to read recent messages, (3) save_memory with a summary. Returns the number of deleted messages. Pass restart_context: true to also restart Claude for a full context reset (only works under supervisor daemon).",
       inputSchema: {
         type: "object",
         properties: {
           chat_id: {
             type: "string",
             description: "Chat ID to clear history for.",
+          },
+          restart_context: {
+            type: "boolean",
+            description:
+              "If true, signal the supervisor daemon to restart Claude for a full context reset. Send your Telegram reply BEFORE calling clear_history with this flag — the process will be killed ~3 seconds after.",
           },
         },
         required: ["chat_id"],
@@ -1161,8 +1166,31 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       case "clear_history": {
         const chat_id = args.chat_id as string;
+        const restartContext = args.restart_context === true;
         assertAllowedChat(chat_id);
         const deleted = messageStore.clearHistory(chat_id);
+
+        if (restartContext) {
+          // Write restart signal for the supervisor daemon.
+          // Include a "restart after" timestamp so the supervisor waits
+          // for Claude to finish sending Telegram replies.
+          try {
+            mkdirSync(DATA_DIR, { recursive: true });
+            const restartAfter = Date.now() + 3000;
+            writeFileSync(join(DATA_DIR, "restart.signal"), `${restartAfter}\n`);
+          } catch (err) {
+            process.stderr.write(`telegram channel: could not write restart signal: ${err}\n`);
+          }
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Cleared ${deleted} messages from chat ${chat_id}. Restart signal sent — Claude will restart in ~3 seconds for a fresh context. The bot will reconnect automatically. Do NOT send any more tool calls.`,
+              },
+            ],
+          };
+        }
+
         return {
           content: [
             {
