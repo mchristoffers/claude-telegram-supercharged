@@ -19,9 +19,10 @@ import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { execSync } from 'child_process'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+import { Database } from 'bun:sqlite'
 
 const ALLOWED_REACTIONS = new Set([
   '👍','👎','❤','🔥','🥰','👏','😁','🤔','🤯','😱','🤬','😢','🎉','🤩','🤮','💩',
@@ -57,6 +58,152 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const DATA_DIR = join(STATE_DIR, 'data')
+const DB_PATH = join(DATA_DIR, 'messages.db')
+
+// ── Message history store (bun:sqlite) ──────────────────────────────
+// Stores every delivered message so Claude has context across restarts.
+// Rolling buffer: max 500 messages per chat, 14-day TTL, 50MB hard limit.
+
+class MessageStore {
+  private db: Database
+  private insertCount = 0
+
+  constructor(dbPath: string) {
+    mkdirSync(join(dbPath, '..'), { recursive: true })
+    this.db = new Database(dbPath, { create: true })
+    this.db.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      PRAGMA cache_size = -16000;
+      PRAGMA busy_timeout = 5000;
+      PRAGMA foreign_keys = ON;
+      PRAGMA auto_vacuum = INCREMENTAL;
+    `)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id      INTEGER NOT NULL,
+        chat_id         TEXT NOT NULL,
+        user_id         TEXT,
+        username        TEXT,
+        first_name      TEXT,
+        text            TEXT,
+        media_type      TEXT,
+        caption         TEXT,
+        reply_to_msg_id INTEGER,
+        date            INTEGER NOT NULL,
+        edit_date       INTEGER,
+        is_outgoing     INTEGER DEFAULT 0,
+        UNIQUE(chat_id, message_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_messages_chat_date ON messages(chat_id, date DESC);
+      CREATE INDEX IF NOT EXISTS idx_messages_chat_reply ON messages(chat_id, reply_to_msg_id) WHERE reply_to_msg_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);
+    `)
+  }
+
+  store(msg: {
+    message_id: number
+    chat_id: string
+    user_id?: string
+    username?: string
+    first_name?: string
+    text?: string
+    media_type?: string
+    caption?: string
+    reply_to_msg_id?: number
+    date: number
+    is_outgoing?: boolean
+  }): void {
+    this.db.run(
+      `INSERT OR REPLACE INTO messages
+       (message_id, chat_id, user_id, username, first_name, text, media_type, caption, reply_to_msg_id, date, is_outgoing)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        msg.message_id, msg.chat_id, msg.user_id ?? null, msg.username ?? null,
+        msg.first_name ?? null, msg.text ?? null, msg.media_type ?? null,
+        msg.caption ?? null, msg.reply_to_msg_id ?? null, msg.date,
+        msg.is_outgoing ? 1 : 0,
+      ],
+    )
+    this.insertCount++
+    if (this.insertCount % 100 === 0) this.prune()
+  }
+
+  /** Get last N messages from a chat, newest first. */
+  getHistory(chatId: string, limit = 50, before?: number): Array<Record<string, unknown>> {
+    if (before) {
+      return this.db.query(
+        `SELECT * FROM messages WHERE chat_id = ? AND date < ? ORDER BY date DESC LIMIT ?`,
+      ).all(chatId, before, limit) as Array<Record<string, unknown>>
+    }
+    return this.db.query(
+      `SELECT * FROM messages WHERE chat_id = ? ORDER BY date DESC LIMIT ?`,
+    ).all(chatId, limit) as Array<Record<string, unknown>>
+  }
+
+  /** Search messages by text pattern (LIKE %query%). */
+  search(chatId: string, query: string, limit = 20): Array<Record<string, unknown>> {
+    return this.db.query(
+      `SELECT * FROM messages WHERE chat_id = ? AND text LIKE ? ORDER BY date DESC LIMIT ?`,
+    ).all(chatId, `%${query}%`, limit) as Array<Record<string, unknown>>
+  }
+
+  /** Format last N messages for injection into Claude's context. */
+  formatRecent(chatId: string, count = 5): string {
+    const msgs = this.getHistory(chatId, count)
+    if (msgs.length === 0) return ''
+    // Reverse to chronological order (oldest first)
+    msgs.reverse()
+    const lines = msgs.map(m => {
+      const ts = new Date((m.date as number) * 1000).toISOString().slice(0, 16).replace('T', ' ')
+      const sender = m.is_outgoing ? '[BOT]' : `@${m.username ?? m.user_id ?? '?'}`
+      const replyTag = m.reply_to_msg_id ? ` (reply to #${m.reply_to_msg_id})` : ''
+      const content = m.text ?? (m.media_type ? `[${m.media_type}]` : '[no text]')
+      return `[${ts}] ${sender}${replyTag}: ${(content as string).slice(0, 300)}`
+    })
+    return `[Recent history — last ${msgs.length} messages]\n${lines.join('\n')}`
+  }
+
+  /** Prune old messages: 500/chat cap + 14-day TTL. */
+  private prune(): void {
+    const cutoff = Math.floor(Date.now() / 1000) - 14 * 86400
+    this.db.run(`DELETE FROM messages WHERE date < ?`, [cutoff])
+    // Count-based: keep last 500 per chat
+    this.db.run(`
+      DELETE FROM messages WHERE id IN (
+        SELECT m.id FROM messages m
+        WHERE (SELECT COUNT(*) FROM messages m2 WHERE m2.chat_id = m.chat_id AND m2.date >= m.date) > 500
+      )
+    `)
+    // Size check — if over 50MB, aggressively trim to 200/chat
+    const pageCount = (this.db.query('PRAGMA page_count').get() as any)?.page_count ?? 0
+    const pageSize = (this.db.query('PRAGMA page_size').get() as any)?.page_size ?? 4096
+    if (pageCount * pageSize > 50 * 1024 * 1024) {
+      this.db.run(`
+        DELETE FROM messages WHERE id IN (
+          SELECT m.id FROM messages m
+          WHERE (SELECT COUNT(*) FROM messages m2 WHERE m2.chat_id = m.chat_id AND m2.date >= m.date) > 200
+        )
+      `)
+      this.db.exec('PRAGMA incremental_vacuum(100)')
+    }
+  }
+
+  close(): void {
+    try {
+      this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+      this.db.close()
+    } catch {}
+  }
+}
+
+const messageStore = new MessageStore(DB_PATH)
+
+// Graceful shutdown — checkpoint and close the database.
+process.on('SIGINT', () => { messageStore.close(); process.exit(0) })
+process.on('SIGTERM', () => { messageStore.close(); process.exit(0) })
 
 const bot = new Bot(TOKEN)
 let botUsername = ''
@@ -74,6 +221,10 @@ type PendingEntry = {
   createdAt: number
   expiresAt: number
   replies: number
+  /** 'group' for group pairing, absent or 'dm' for DM pairing (backwards compat). */
+  type?: 'dm' | 'group'
+  /** Group chat title, stored for display purposes. */
+  groupTitle?: string
 }
 
 type GroupPolicy = {
@@ -310,7 +461,36 @@ function gate(ctx: Context): GateResult {
   if (chatType === 'group' || chatType === 'supergroup') {
     const groupId = String(ctx.chat!.id)
     const policy = access.groups[groupId]
-    if (!policy) return { action: 'drop' }
+    if (!policy) {
+      const title = (ctx.chat as any)?.title ?? 'unknown'
+      process.stderr.write(`telegram channel: unregistered group "${title}" (chat_id=${groupId})\n`)
+
+      // Group pairing — same flow as DM pairing.
+      // Check for existing pending code for this group.
+      for (const [code, p] of Object.entries(access.pending)) {
+        if (p.chatId === groupId && p.type === 'group') {
+          if ((p.replies ?? 1) >= 2) return { action: 'drop' }
+          p.replies = (p.replies ?? 1) + 1
+          saveAccess(access)
+          return { action: 'pair', code, isResend: true }
+        }
+      }
+      if (Object.keys(access.pending).length >= 6) return { action: 'drop' }
+
+      const code = randomBytes(3).toString('hex')
+      const now = Date.now()
+      access.pending[code] = {
+        senderId,
+        chatId: groupId,
+        createdAt: now,
+        expiresAt: now + 60 * 60 * 1000,
+        replies: 1,
+        type: 'group',
+        groupTitle: title,
+      }
+      saveAccess(access)
+      return { action: 'pair', code, isResend: false }
+    }
     const groupAllowFrom = policy.allowFrom ?? []
     const requireMention = policy.requireMention ?? true
     if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
@@ -424,7 +604,7 @@ const mcp = new Server(
       '',
       'Messages use Telegram MarkdownV2 by default. Formatting: *bold*, _italic_, `code`, ```pre```, ~strikethrough~, __underline__, ||spoiler||, [link](url). IMPORTANT: In MarkdownV2, these characters MUST be escaped with \\ when used literally (not as formatting): _ * [ ] ( ) ~ ` > # + - = | { } . ! Use parse_mode "plain" if escaping is too complex for a given message.',
       '',
-      "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
+      "Message history is stored locally in SQLite. Use get_history(chat_id) to retrieve recent messages (up to 200) and search_messages(chat_id, query) to search by text. History is available from when the bot joined the chat and persists across restarts. The last 5 messages are auto-injected with each notification for context.",
       '',
       'THREADING IN GROUPS: In group chats, messages may include reply_to_message_id and reply_to_text/reply_to_user attributes showing what message was being replied to. Use this context to follow conversation threads. When you reply in a group, ALWAYS set reply_to to the message_id that triggered your response — this keeps conversations threaded in the Telegram UI. If a message has a thread_id attribute, it belongs to a Telegram Forum topic.',
       '',
@@ -530,6 +710,50 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'text', 'buttons'],
       },
     },
+    {
+      name: 'get_history',
+      description: 'Retrieve recent message history from a Telegram chat. Returns messages stored locally since the bot joined. Use this to get context about earlier conversation without asking the user to repeat themselves.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: {
+            type: 'string',
+            description: 'Chat ID to get history for.',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max messages to return (default 50, max 200).',
+          },
+          before: {
+            type: 'number',
+            description: 'Unix timestamp — only return messages before this time. For pagination.',
+          },
+        },
+        required: ['chat_id'],
+      },
+    },
+    {
+      name: 'search_messages',
+      description: 'Search message history by text pattern. Returns messages containing the query string from a specific chat.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: {
+            type: 'string',
+            description: 'Chat ID to search in.',
+          },
+          query: {
+            type: 'string',
+            description: 'Text to search for (case-insensitive substring match).',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results to return (default 20, max 100).',
+          },
+        },
+        required: ['chat_id', 'query'],
+      },
+    },
   ],
 }))
 
@@ -601,13 +825,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
-        // Track bot's own messages for thread context.
+        // Track bot's own messages for thread context + history.
         for (const sid of sentIds) {
           trackMessage(chat_id, sid, {
             sender: botUsername ?? 'bot',
             text: text.slice(0, 200),
             ts: Date.now(),
             replyTo: reply_to,
+          })
+          messageStore.store({
+            message_id: sid,
+            chat_id,
+            username: botUsername ?? 'bot',
+            text: text.slice(0, 2000),
+            reply_to_msg_id: reply_to,
+            date: Math.floor(Date.now() / 1000),
+            is_outgoing: true,
           })
         }
 
@@ -682,6 +915,42 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         return { content: [{ type: 'text', text: `user chose: ${choice}` }] }
       }
+      case 'get_history': {
+        const chat_id = args.chat_id as string
+        assertAllowedChat(chat_id)
+        const limit = Math.min(Math.max(1, (args.limit as number | undefined) ?? 50), 200)
+        const before = args.before as number | undefined
+        const msgs = messageStore.getHistory(chat_id, limit, before)
+        if (msgs.length === 0) {
+          return { content: [{ type: 'text', text: 'No messages found in history for this chat.' }] }
+        }
+        // Format for readability — chronological order
+        const formatted = msgs.reverse().map(m => {
+          const ts = new Date((m.date as number) * 1000).toISOString().slice(0, 16).replace('T', ' ')
+          const sender = m.is_outgoing ? '[BOT]' : `@${m.username ?? m.user_id ?? '?'}`
+          const replyTag = m.reply_to_msg_id ? ` (reply to #${m.reply_to_msg_id})` : ''
+          const content = m.text ?? (m.media_type ? `[${m.media_type}]` : '[no text]')
+          return `[${ts}] #${m.message_id} ${sender}${replyTag}: ${(content as string).slice(0, 500)}`
+        }).join('\n')
+        return { content: [{ type: 'text', text: `${msgs.length} messages:\n\n${formatted}` }] }
+      }
+      case 'search_messages': {
+        const chat_id = args.chat_id as string
+        assertAllowedChat(chat_id)
+        const query = args.query as string
+        const limit = Math.min(Math.max(1, (args.limit as number | undefined) ?? 20), 100)
+        const msgs = messageStore.search(chat_id, query, limit)
+        if (msgs.length === 0) {
+          return { content: [{ type: 'text', text: `No messages matching "${query}" found.` }] }
+        }
+        const formatted = msgs.reverse().map(m => {
+          const ts = new Date((m.date as number) * 1000).toISOString().slice(0, 16).replace('T', ' ')
+          const sender = m.is_outgoing ? '[BOT]' : `@${m.username ?? m.user_id ?? '?'}`
+          const content = m.text ?? '[no text]'
+          return `[${ts}] #${m.message_id} ${sender}: ${(content as string).slice(0, 500)}`
+        }).join('\n')
+        return { content: [{ type: 'text', text: `${msgs.length} matches for "${query}":\n\n${formatted}` }] }
+      }
       default:
         return {
           content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }],
@@ -748,6 +1017,33 @@ function videoToCollage(srcPath: string, outPath: string, maxFrames = 6): string
     return undefined
   }
 }
+
+// ── Store ALL messages before gate check ──────────────────────────
+// This middleware runs for every message (text, photo, voice, etc.)
+// and stores it in SQLite regardless of whether the gate passes.
+// This way get_history returns the full group conversation, not just
+// messages addressed to the bot.
+bot.on('message', async (ctx, next) => {
+  const msg = ctx.message
+  if (msg) {
+    const from = msg.from
+    messageStore.store({
+      message_id: msg.message_id,
+      chat_id: String(ctx.chat.id),
+      user_id: from ? String(from.id) : undefined,
+      username: from?.username,
+      first_name: from?.first_name,
+      text: msg.text ?? msg.caption ?? undefined,
+      media_type: msg.photo ? 'photo' : msg.voice ? 'voice' : msg.audio ? 'audio'
+        : msg.sticker ? 'sticker' : msg.animation ? 'animation' : undefined,
+      caption: msg.caption ?? undefined,
+      reply_to_msg_id: msg.reply_to_message?.message_id,
+      date: msg.date,
+      is_outgoing: false,
+    })
+  }
+  await next()
+})
 
 bot.on('message:text', async ctx => {
   await handleInbound(ctx, ctx.message.text, undefined)
@@ -1041,12 +1337,16 @@ async function handleInbound(
     }
   }
 
+  // Message already stored by the bot.on('message') middleware above.
+  // Auto-inject recent history so Claude has context.
+  const recentHistory = messageStore.formatRecent(chat_id, 5)
+
   // media paths go in meta only — an in-content annotation is forgeable
   // by any allowlisted sender typing that string.
   void mcp.notification({
     method: 'notifications/claude/channel',
     params: {
-      content: text,
+      content: recentHistory ? `${text}\n\n${recentHistory}` : text,
       meta: {
         chat_id,
         ...(msgId != null ? { message_id: String(msgId) } : {}),

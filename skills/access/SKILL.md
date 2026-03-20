@@ -40,7 +40,9 @@ Arguments passed: `$ARGUMENTS`
   "pending": {
     "<6-char-code>": {
       "senderId": "...", "chatId": "...",
-      "createdAt": <ms>, "expiresAt": <ms>
+      "createdAt": <ms>, "expiresAt": <ms>,
+      "type": "dm" | "group",
+      "groupTitle": "..."
     }
   },
   "mentionPatterns": ["@mybot"]
@@ -66,14 +68,27 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 1. Read `~/.claude/channels/telegram/access.json`.
 2. Look up `pending[<code>]`. If not found or `expiresAt < Date.now()`,
    tell the user and stop.
-3. Extract `senderId` and `chatId` from the pending entry.
-4. Add `senderId` to `allowFrom` (dedupe).
-5. Delete `pending[<code>]`.
-6. Write the updated access.json.
-7. `mkdir -p ~/.claude/channels/telegram/approved` then write
-   `~/.claude/channels/telegram/approved/<senderId>` with `chatId` as the
-   file contents. The channel server polls this dir and sends "you're in".
-8. Confirm: who was approved (senderId).
+3. Check the entry's `type` field:
+
+   **If `type` is `"group"` (group pairing):**
+   a. Extract `chatId` (the group ID) and `groupTitle` from the entry.
+   b. Add `groups[chatId] = { requireMention: true, allowFrom: [] }` (dedupe).
+   c. Delete `pending[<code>]`.
+   d. Write the updated access.json.
+   e. `mkdir -p ~/.claude/channels/telegram/approved` then write
+      `~/.claude/channels/telegram/approved/<chatId>` with `chatId` as the
+      file contents. The channel server polls this dir and sends confirmation.
+   f. Confirm: which group was added (groupTitle, chatId).
+
+   **Otherwise (DM pairing, default):**
+   a. Extract `senderId` and `chatId` from the pending entry.
+   b. Add `senderId` to `allowFrom` (dedupe).
+   c. Delete `pending[<code>]`.
+   d. Write the updated access.json.
+   e. `mkdir -p ~/.claude/channels/telegram/approved` then write
+      `~/.claude/channels/telegram/approved/<senderId>` with `chatId` as the
+      file contents. The channel server polls this dir and sends "you're in".
+   f. Confirm: who was approved (senderId).
 
 ### `deny <code>`
 

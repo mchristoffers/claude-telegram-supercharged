@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./banner.png" alt="Claude Telegram Supercharged" width="100%" />
+<img src="./banner.jpg" alt="Claude Telegram Supercharged" width="100%" />
 
 <h3>Community fork of Claude Code's Telegram plugin with threading, voice, stickers, reactions, and more.</h3>
 
@@ -40,6 +40,7 @@ Anthropic's Claude Code Channels is an amazing product with huge potential. But 
 - [Voice & Audio Messages](#voice--audio-messages)
 - [Group Chats & Conversation Threading](#group-chats--conversation-threading)
 - [Access Control](#access-control)
+- [Message History](#message-history-buffer)
 - [Limitations](#limitations)
 - [Roadmap](#roadmap)
 - [Feature Details](#feature-details)
@@ -137,6 +138,8 @@ Then restart your Claude Code session.
 | **Emoji Reaction Tracking** | Claude receives and acts on user reactions as lightweight feedback |
 | **Reaction Status Indicators** | Visual processing status via emoji reactions (read / working / done) |
 | **Emoji Reaction Validation** | Client-side whitelist prevents cryptic `REACTION_INVALID` errors |
+| **Group Pairing** | Add your bot to a group, send a message, get a pairing code -- no need to hunt for numeric chat IDs |
+| **Message History** | SQLite-backed rolling message store -- Claude has context across restarts, can search and retrieve past messages |
 
 ## Tools Exposed to the Assistant
 
@@ -146,6 +149,8 @@ Then restart your Claude Code session.
 | `react` | Add an emoji reaction to a message by ID. **Only Telegram's fixed whitelist** is accepted (👍 👎 ❤ 🔥 👀 🎉 😂 🤔 etc). Also used for status indicators (👀 read → 👍 done). |
 | `edit_message` | Edit a message the bot previously sent. Supports `parse_mode` (MarkdownV2/HTML/plain). Useful for "working..." → result progress updates. Only works on the bot's own messages. |
 | `ask_user` | Send a question with inline keyboard buttons and wait for the user's choice. Takes `chat_id`, `text`, `buttons` (array of labels), optional `parse_mode` and `timeout` (default 120s). Returns the label of the tapped button. |
+| `get_history` | Retrieve recent message history from a chat. Takes `chat_id`, optional `limit` (default 50, max 200), optional `before` (unix timestamp for pagination). Returns formatted messages with timestamps, senders, and content. |
+| `search_messages` | Search message history by text pattern. Takes `chat_id`, `query` (substring match), optional `limit` (default 20, max 100). Returns matching messages. |
 
 ### Inbound Events
 
@@ -193,26 +198,23 @@ By default, Telegram bots in groups only see commands and messages that mention 
 
 Add your bot to any Telegram group like a normal member.
 
-**3. Register the group**
+**3. Pair the group (automatic)**
 
-You need the group's numeric ID (starts with `-100...`). Several ways to find it:
-
-- **From the bot logs** -- when your bot is in the group and someone sends a message, the bot logs show the `chat_id` in stderr. Check with `claude` running and look for the group ID in the terminal output.
-- **Telegram Web** -- open [web.telegram.org](https://web.telegram.org), navigate to the group. The URL contains the group ID (e.g. `web.telegram.org/a/#-1001234567890`).
-- **Forward a message** -- forward any message from the group to [@RawDataBot](https://t.me/RawDataBot) in a DM. It replies with JSON containing the `chat.id`.
-- **BotFather API** -- after adding your bot to the group, send a message mentioning the bot, then check `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in your browser. Look for `"chat":{"id":-100...}`.
-
-Then in your Claude Code session:
+Just send a message in the group mentioning your bot (e.g. `@your_bot hello`). The bot replies with a 6-character pairing code -- same flow as DM pairing:
 
 ```
-/telegram:access group add -100XXXXXXXXXX
+/telegram:access pair <code>
 ```
 
-By default, `requireMention` is `true` -- the bot only responds when mentioned or replied to. To let it see all messages:
+That's it. The group is registered automatically with `requireMention: true` (bot only responds when mentioned or replied to).
+
+To let it respond to all messages:
 
 ```
 /telegram:access group update -100XXXXXXXXXX requireMention false
 ```
+
+> **Manual alternative:** If you already know the group's numeric ID (starts with `-100...`), you can register directly with `/telegram:access group add -100XXXXXXXXXX`. Ways to find the ID: check the bot's stderr logs, open [web.telegram.org](https://web.telegram.org) (ID is in the URL), or forward a group message to [@RawDataBot](https://t.me/RawDataBot).
 
 **4. Restart Claude Code**
 
@@ -235,13 +237,29 @@ If your supergroup has **Topics** enabled, the plugin forwards `thread_id` (Tele
 
 Full access control docs in [ACCESS.md](./ACCESS.md) -- DM policies, groups, mention detection, delivery config, skill commands, and the `access.json` schema.
 
-Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](https://t.me/userinfobot)). Default policy is `pairing`. `ackReaction` only accepts Telegram's fixed emoji whitelist.
+Quick reference: Default policy is `pairing` -- DMs and groups both use the pairing flow. For DMs, message the bot to get a code. For groups, add the bot and mention it to get a code. Then `/telegram:access pair <code>` approves either. `ackReaction` only accepts Telegram's fixed emoji whitelist.
+
+## Message History Buffer
+
+Every message flowing through the bot is captured in a local SQLite database and persisted across restarts. Claude gets context without asking users to repeat themselves.
+
+```
+~/.claude/channels/telegram/data/messages.db
+```
+
+**How it works:**
+- A grammY middleware intercepts ALL messages (including group messages without @bot mention) before the gate check
+- Both inbound messages and bot replies are stored with `INSERT OR REPLACE` dedup
+- Last 5 messages are auto-injected into each notification so Claude always has rolling context
+- `get_history` retrieves up to 200 messages with pagination; `search_messages` does substring search
+- SQLite WAL mode ensures crash-safe writes -- if Claude Code crashes, the DB auto-recovers on next startup
+- Rolling buffer prunes automatically: 500 messages/chat cap, 14-day TTL, 50MB hard limit
 
 ## Limitations
 
-Telegram's Bot API exposes **neither** message history nor search. The bot only sees messages as they arrive -- no `fetch_messages` tool exists. If the assistant needs earlier context, it will ask you to paste or summarize.
+Telegram's Bot API exposes **no native history endpoint** -- bots only see messages in real-time. We solve this with a local SQLite message store (see [Message History](#message-history-buffer) below). Every message flowing through the bot is captured and persisted, giving Claude full context across restarts via `get_history` and `search_messages` tools. History is available from when the bot joined the chat.
 
-This also means there's no `download_attachment` tool for historical messages -- photos are downloaded eagerly on arrival since there's no way to fetch them later.
+Photos and voice messages are downloaded eagerly on arrival -- there's no way to fetch attachments from historical messages via the Bot API.
 
 ## Roadmap
 
@@ -255,10 +273,12 @@ This also means there's no `download_attachment` tool for historical messages --
 - [x] Sticker & GIF support
 - [x] Emoji reaction validation
 - [x] Conversation threading
+- [x] Group pairing flow (no manual chat ID lookup needed)
+- [x] Message history buffer (SQLite, rolling store, `get_history` + `search_messages` tools)
 
 ### Planned
-
-- [ ] **Message history buffer** -- Keep a rolling buffer of recent messages so Claude has context without asking users to repeat themselves
+- [ ] **Daemon mode wrapper** -- tmux + systemd auto-reconnect for always-on operation
+- [ ] **Remote permission approval** -- Approve Claude Code permission prompts via Telegram inline buttons
 - [ ] **Scheduled messages** -- Send messages at a specific time
 - [ ] **Multi-bot support** -- Run multiple bots from one server instance
 - [ ] **Rate limiting & usage stats** -- Track token usage and set limits per user
@@ -370,6 +390,69 @@ In group chats, multiple conversations happen simultaneously. Without threading,
 - **Forum topic support** -- Telegram supergroup topics (`message_thread_id`) are forwarded as `thread_id` and passed through to replies, keeping conversations in their correct topic
 - **Bot message tracking** -- bot's own sent messages are tracked so reply chains work when users reply to the bot
 - Zero persistence needed -- in-memory only, bounded and self-pruning
+
+</details>
+
+<details>
+<summary><strong>Message history buffer</strong></summary>
+
+<br />
+
+Telegram Bot API has no history endpoint. Bots only see messages in real-time. Close the laptop = messages lost. Restart Claude Code = context gone. We solved this with a 3-tier approach -- Tier 1 ships now with zero extra infra.
+
+### The Problem
+
+The official plugin is stateless -- Claude only sees messages as they arrive. Restart Claude Code and all context is gone.
+
+### Tier 1: Real-time Capture (Shipped)
+
+| Aspect | Detail |
+| --- | --- |
+| **Storage** | `bun:sqlite` (built into Bun, 3-6x faster than better-sqlite3, 80K inserts/sec) |
+| **Schema** | `messages` table with `UNIQUE(chat_id, message_id)`, indexed on `(chat_id, date DESC)` |
+| **Buffer** | Hybrid: 500 messages/chat + 14-day TTL + 50MB hard limit |
+| **Pruning** | Batch every 100 inserts, not per-insert triggers |
+| **Context injection** | Auto-inject last 5 messages with each notification (~800 tokens) |
+| **New MCP tools** | `get_history(chat_id, limit)` + `search_messages(chat_id, query)` |
+| **DB location** | `~/.claude/channels/telegram/data/messages.db` |
+| **Crash recovery** | Automatic via SQLite WAL -- the DB IS the recovery mechanism |
+| **Group capture** | grammY middleware captures ALL group messages, even without @bot mention |
+| **History depth** | From when the bot joined the chat |
+
+### Tier 2: History Backfill (Planned -- needs a user account)
+
+| Aspect | Detail |
+| --- | --- |
+| **Library** | GramJS (JS/TS, same ecosystem as our plugin) |
+| **Auth** | Dedicated phone number -> StringSession (one-time interactive setup) |
+| **API** | `messages.getHistory` -- 100 messages/request, ~7,500 messages/minute |
+| **Architecture** | Parallel process writes to same SQLite DB, dedup via `UNIQUE(chat_id, message_id)` |
+| **History depth** | Complete -- all messages ever sent in the chat |
+
+### Tier 3: Always-On Daemon (Planned)
+
+| Approach | Detail |
+| --- | --- |
+| **tmux + systemd on VPS** | Most battle-tested pattern for always-on bots |
+| **Permissions** | Use `allowedTools` in settings.json, NOT `--dangerously-skip-permissions` |
+| **Remote approval** | Telegram inline buttons for Allow/Deny on permission prompts |
+| **Message buffering** | Telegram buffers offline bot messages for 24h; store last `update_id` persistently |
+
+</details>
+
+<details>
+<summary><strong>Group pairing flow</strong></summary>
+
+<br />
+
+The official plugin requires you to manually find your group's numeric chat ID (a `-100...` number) using external bots or API calls. We added automatic pairing -- the same flow as DM pairing, but for groups.
+
+- Add your bot to a group and send a message mentioning it
+- The bot replies with a 6-character pairing code in the group chat
+- Run `/telegram:access pair <code>` in your Claude Code session
+- The group is automatically registered with `requireMention: true` and open `allowFrom`
+- No need to hunt for numeric IDs, use external bots, or read API responses
+- The pending entry includes a `type: "group"` discriminator so the pair command knows to add to `groups` instead of `allowFrom`
 
 </details>
 
