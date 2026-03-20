@@ -26,7 +26,7 @@
 
 ## Claude Telegram Supercharged
 
-Drop-in upgrade for the official Claude Code Telegram plugin. Install once, get 15+ features the official plugin doesn't have. Built on top of the official plugin -- everything works, just better.
+Drop-in upgrade for the [official Claude Code Telegram plugin](https://github.com/anthropics/claude-plugins-official/tree/main/external_plugins/telegram). Install once, get 15+ features the official plugin doesn't have. Built on top of the [official plugin](https://github.com/anthropics/claude-plugins-official/tree/main/external_plugins/telegram) -- everything works, just better.
 
 2 minutes to install. Zero config. Your existing bot and pairing keep working.
 
