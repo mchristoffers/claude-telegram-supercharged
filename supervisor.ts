@@ -109,13 +109,9 @@ function startClaude(): void {
 
 	lastStartTime = Date.now();
 	const args = [...BASE_ARGS, ...EXTRA_ARGS];
-	// Always start Claude in the user's home directory so it picks up ~/CLAUDE.md
-	// and doesn't depend on where the supervisor was launched from.
-	const cwd = process.env.CLAUDE_DAEMON_CWD || homedir();
-	log(`spawning: ${CLAUDE_CMD} ${args.join(" ")} (cwd: ${cwd})`);
+	log(`spawning: ${CLAUDE_CMD} ${args.join(" ")}`);
 	const child = spawn(CLAUDE_CMD, args, {
 		stdio: "inherit",
-		cwd,
 		env: { ...process.env },
 		detached: true, // Create a new process group so we can kill the entire tree
 	});
