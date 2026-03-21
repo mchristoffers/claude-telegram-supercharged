@@ -245,6 +245,40 @@ function markdownToTelegraphNodes(markdown: string): TelegraphNode[] {
     // Horizontal rule
     if (/^[-*_]{3,}\s*$/.test(line)) { nodes.push({ tag: "hr" }); i++; continue; }
 
+    // Markdown table — convert to pre-formatted monospace block (Telegraph has no <table>)
+    if (line.includes("|") && line.trim().startsWith("|")) {
+      const parseRow = (row: string): string[] =>
+        row.split("|").map((c) => c.trim()).filter((c) => c.length > 0);
+      const headers = parseRow(line);
+      i++;
+      // Skip separator row (|---|---|)
+      if (i < lines.length && /^[\s|:-]+$/.test(lines[i])) i++;
+      // Parse data rows
+      const rows: string[][] = [];
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim().startsWith("|")) {
+        rows.push(parseRow(lines[i]));
+        i++;
+      }
+      // Render as pre-formatted monospace table with pipe separators
+      const colCount = Math.max(headers.length, ...rows.map((r) => r.length));
+      const widths: number[] = [];
+      for (let c = 0; c < colCount; c++) {
+        widths.push(Math.max(
+          (headers[c] ?? "").length,
+          ...rows.map((r) => (r[c] ?? "").length),
+        ));
+      }
+      const pad = (s: string, w: number) => s + " ".repeat(Math.max(0, w - s.length));
+      const headerLine = headers.map((h, c) => pad(h, widths[c])).join(" | ");
+      const separator = widths.map((w) => "-".repeat(w)).join("-+-");
+      const dataLines = rows.map((row) =>
+        row.map((cell, c) => pad(cell, widths[c])).join(" | "),
+      );
+      const tableText = [headerLine, separator, ...dataLines].join("\n");
+      nodes.push({ tag: "pre", children: [tableText] });
+      continue;
+    }
+
     // Headings (h4 before h3 so #### matches first)
     const h4 = line.match(/^#{4}\s+(.+)/);
     if (h4) { nodes.push({ tag: "h4", children: inlineToNodes(h4[1]) }); i++; continue; }
