@@ -110,7 +110,11 @@ function startClaude(): void {
 	lastStartTime = Date.now();
 	const args = [...BASE_ARGS, ...EXTRA_ARGS];
 	log(`spawning: ${CLAUDE_CMD} ${args.join(" ")}`);
-	const child = spawn(CLAUDE_CMD, args, {
+	// Use `expect` wrapper to allocate a PTY and auto-accept the workspace trust dialog.
+	// expect spawns Claude with a pseudo-TTY (so it enters interactive mode under launchd)
+	// and auto-sends Enter when it sees the "trust this folder" prompt.
+	const EXPECT_WRAPPER = join(homedir(), ".claude", "scripts", "claude-daemon-wrapper.exp");
+	const child = spawn(EXPECT_WRAPPER, args, {
 		stdio: "inherit",
 		env: { ...process.env },
 		detached: true, // Create a new process group so we can kill the entire tree
@@ -238,18 +242,36 @@ async function cleanupOrphans(): Promise<void> {
 			.map((p) => Number.parseInt(p.trim(), 10))
 			.filter((p) => !Number.isNaN(p) && p !== myPid);
 
+		// Filter out interactive sessions (processes with a TTY are user terminals)
+		const orphanPids: number[] = [];
 		for (const pid of pids) {
+			try {
+				const tty = execSync(`ps -p ${pid} -o tty=`, {
+					encoding: "utf-8",
+				}).trim();
+				if (tty && tty !== "??" && tty !== "") {
+					log(`skipping pid=${pid} (interactive session on ${tty})`);
+					continue;
+				}
+			} catch {
+				// ps failed — process may already be dead, skip it
+				continue;
+			}
+			orphanPids.push(pid);
+		}
+
+		for (const pid of orphanPids) {
 			log(`killing orphaned process pid=${pid}`);
 			try {
 				process.kill(pid, "SIGTERM");
 			} catch {}
 		}
 
-		if (pids.length > 0) {
+		if (orphanPids.length > 0) {
 			// Give them time to die
 			await new Promise((r) => setTimeout(r, 2000));
 			// Force kill any survivors
-			for (const pid of pids) {
+			for (const pid of orphanPids) {
 				try {
 					process.kill(pid, "SIGKILL");
 				} catch {} // already dead — fine

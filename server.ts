@@ -131,11 +131,56 @@ if (!TOKEN) {
   );
   process.exit(1);
 }
+
 const INBOX_DIR = join(STATE_DIR, "inbox");
 const DATA_DIR = join(STATE_DIR, "data");
 const DB_PATH = join(DATA_DIR, "messages.db");
 const MEMORY_FILE = join(DATA_DIR, "memory.md");
 const MEMORY_MAX_CHARS = 10_000;
+
+// --- Single-instance lock ---
+const LOCK_FILE = join(DATA_DIR, "telegram.lock");
+
+function acquireLock(): void {
+  if (existsSync(LOCK_FILE)) {
+    const existingPid = Number.parseInt(readFileSync(LOCK_FILE, "utf-8").trim(), 10);
+    if (!Number.isNaN(existingPid)) {
+      try {
+        process.kill(existingPid, 0); // signal 0 = check alive, don't kill
+        process.stderr.write(
+          `telegram channel: another instance is already running (pid=${existingPid})\n  lock file: ${LOCK_FILE}\n  kill the other process first, or delete the lock file if it's stale.\n`,
+        );
+        process.exit(1);
+      } catch {
+        // PID is dead — stale lock, safe to overwrite
+        process.stderr.write(`telegram channel: removing stale lock (pid=${existingPid} is dead)\n`);
+      }
+    }
+  }
+  writeFileSync(LOCK_FILE, String(process.pid));
+  process.stderr.write(`telegram channel: lock acquired (pid=${process.pid})\n`);
+}
+
+function releaseLock(): void {
+  try {
+    if (existsSync(LOCK_FILE)) {
+      const content = readFileSync(LOCK_FILE, "utf-8").trim();
+      if (content === String(process.pid)) rmSync(LOCK_FILE, { force: true });
+    }
+  } catch {}
+}
+
+process.on("exit", releaseLock);
+process.on("SIGINT", () => {
+  releaseLock();
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  releaseLock();
+  process.exit(0);
+});
+
+acquireLock();
 
 // ── Telegraph integration ─────────────────────────────────────────────
 // Publishes long-form content to telegra.ph for Instant View in Telegram.
