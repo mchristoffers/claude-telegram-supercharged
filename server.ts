@@ -2206,6 +2206,79 @@ bot.on("message_reaction", async (ctx) => {
   });
 });
 
+// ── Message batching ────────────────────────────────────────────────
+// When multiple messages arrive in quick succession (e.g. forwarded conversation),
+// collect them into a batch and send ONE combined notification to Claude.
+// This prevents Claude from responding to each message individually.
+
+const BATCH_WINDOW_MS = 3000; // 3 seconds of silence before flushing
+
+interface BatchedMessage {
+  text: string;
+  msgId: number | undefined;
+  username: string;
+  userId: string;
+  timestamp: Date;
+  media?: { path: string; type: "image" | "audio" };
+  threadId?: number;
+  replyContext: Record<string, string>;
+  isGroup: boolean;
+  chatId: string;
+}
+
+const pendingBatches = new Map<string, { messages: BatchedMessage[]; timer: ReturnType<typeof setTimeout> }>();
+
+function flushBatch(chatId: string): void {
+  const batch = pendingBatches.get(chatId);
+  if (!batch || batch.messages.length === 0) return;
+  pendingBatches.delete(chatId);
+
+  const msgs = batch.messages;
+  const first = msgs[0];
+  const last = msgs[msgs.length - 1];
+
+  // Combine all message texts
+  const combinedText = msgs.length === 1 ? msgs[0].text : msgs.map((m, i) => `[${i + 1}] ${m.text}`).join("\n\n");
+
+  // Collect all media paths
+  const imagePaths = msgs.filter((m) => m.media?.type === "image").map((m) => m.media!.path);
+  const audioPaths = msgs.filter((m) => m.media?.type === "audio").map((m) => m.media!.path);
+
+  // Use the last message's context for thread tracking
+  const recentHistory = messageStore.formatRecent(chatId, 5);
+  const content = recentHistory ? `${combinedText}\n\n${recentHistory}` : combinedText;
+
+  // For group messages, include thread chain from the last message.
+  const threadChainContext: Record<string, string> = {};
+  if (first.isGroup && last.msgId != null) {
+    const chain = getThreadChain(chatId, last.msgId, 3);
+    if (chain.length > 0) {
+      threadChainContext.thread_context = chain.map((c) => `[${c.sender}]: ${c.text}`).join(" → ");
+    }
+  }
+
+  void mcp.notification({
+    method: "notifications/claude/channel",
+    params: {
+      content,
+      meta: {
+        chat_id: chatId,
+        message_id: last.msgId != null ? String(last.msgId) : undefined,
+        user: last.username,
+        user_id: last.userId,
+        ts: last.timestamp.toISOString(),
+        ...(msgs.length > 1 ? { batch_size: String(msgs.length) } : {}),
+        ...(imagePaths.length > 0 ? { image_path: imagePaths[0] } : {}),
+        ...(imagePaths.length > 1 ? { image_paths: imagePaths.join(",") } : {}),
+        ...(audioPaths.length > 0 ? { audio_path: audioPaths[0] } : {}),
+        ...(last.threadId != null ? { thread_id: String(last.threadId) } : {}),
+        ...last.replyContext,
+        ...threadChainContext,
+      },
+    },
+  });
+}
+
 async function handleInbound(
   ctx: Context,
   inboundText: string,
@@ -2231,10 +2304,10 @@ async function handleInbound(
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
   void bot.api.sendChatAction(chat_id, "typing").catch(() => {});
 
-  // Ack reaction — lets the user know we're processing. Fire-and-forget.
-  // Telegram only accepts a fixed emoji whitelist — if the user configures
-  // something outside that set the API rejects it and we swallow.
-  if (access.ackReaction && msgId != null) {
+  // Ack reaction — only for single messages (not during a burst).
+  // During batching, skip individual ack reactions to avoid spamming.
+  const existingBatch = pendingBatches.get(chat_id);
+  if (!existingBatch && access.ackReaction && msgId != null) {
     void bot.api
       .setMessageReaction(chat_id, msgId, [{ type: "emoji", emoji: access.ackReaction as ReactionTypeEmoji["emoji"] }])
       .catch(() => {});
@@ -2285,21 +2358,18 @@ async function handleInbound(
   // ── Thread tracking ─────────────────────────────────────────────
   const replyToMsg = ctx.message?.reply_to_message;
   const replyToMsgId = replyToMsg?.message_id;
-  // Telegram Forum topic thread_id (present in supergroups with topics enabled).
   const threadId = (ctx.message as any)?.message_thread_id as number | undefined;
 
-  // Track this message in the thread map.
   if (msgId != null) {
     trackMessage(chat_id, msgId, {
       sender: username,
-      text: text.slice(0, 200), // cap stored text to save memory
+      text: text.slice(0, 200),
       ts: timestamp.getTime(),
       replyTo: replyToMsgId,
       threadId,
     });
   }
 
-  // Build reply context for the notification.
   const replyContext: Record<string, string> = {};
   if (replyToMsg) {
     replyContext.reply_to_message_id = String(replyToMsg.message_id);
@@ -2309,39 +2379,33 @@ async function handleInbound(
     }
   }
 
-  // For group messages, include thread chain for additional context.
-  const threadChainContext: Record<string, string> = {};
-  if (isGroup && msgId != null) {
-    const chain = getThreadChain(chat_id, msgId, 3);
-    if (chain.length > 0) {
-      threadChainContext.thread_context = chain.map((c) => `[${c.sender}]: ${c.text}`).join(" → ");
-    }
+  // ── Batch or send immediately ─────────────────────────────────────
+  const batchedMsg: BatchedMessage = {
+    text,
+    msgId,
+    username,
+    userId: String(from.id),
+    timestamp,
+    media: media ? { path: media.path, type: media.type } : undefined,
+    threadId,
+    replyContext,
+    isGroup,
+    chatId: chat_id,
+  };
+
+  const batch = pendingBatches.get(chat_id);
+  if (batch) {
+    // Extend existing batch — reset the timer
+    clearTimeout(batch.timer);
+    batch.messages.push(batchedMsg);
+    batch.timer = setTimeout(() => flushBatch(chat_id), BATCH_WINDOW_MS);
+  } else {
+    // Start a new batch
+    pendingBatches.set(chat_id, {
+      messages: [batchedMsg],
+      timer: setTimeout(() => flushBatch(chat_id), BATCH_WINDOW_MS),
+    });
   }
-
-  // Message already stored by the bot.on('message') middleware above.
-  // Auto-inject recent history so Claude has context.
-  const recentHistory = messageStore.formatRecent(chat_id, 5);
-
-  // media paths go in meta only — an in-content annotation is forgeable
-  // by any allowlisted sender typing that string.
-  void mcp.notification({
-    method: "notifications/claude/channel",
-    params: {
-      content: recentHistory ? `${text}\n\n${recentHistory}` : text,
-      meta: {
-        chat_id,
-        ...(msgId != null ? { message_id: String(msgId) } : {}),
-        user: username,
-        user_id: String(from.id),
-        ts: timestamp.toISOString(),
-        ...(media?.type === "image" ? { image_path: media.path } : {}),
-        ...(media?.type === "audio" ? { audio_path: media.path } : {}),
-        ...(threadId != null ? { thread_id: String(threadId) } : {}),
-        ...replyContext,
-        ...threadChainContext,
-      },
-    },
-  });
 }
 
 void bot.start({
