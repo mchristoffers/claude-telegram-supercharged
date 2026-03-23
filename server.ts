@@ -132,6 +132,8 @@ const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "pNInz6obpgDQGcFmaJgB";
 const OPENAI_WHISPER_MODEL = process.env.OPENAI_WHISPER_MODEL || "whisper-1";
+const ROUTER_MODEL = process.env.TELEGRAM_ROUTER_MODEL || "sonnet";
+const IS_HAIKU_ROUTER = ROUTER_MODEL === "haiku";
 
 if (!TOKEN) {
   process.stderr.write(
@@ -1167,26 +1169,36 @@ const mcp = new Server(
     instructions: [
       "The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat. IMPORTANT: When a Telegram message asks you to do something (write a post, generate code, answer a question), ALWAYS send the full result back via the reply tool. Never just acknowledge the request — deliver the actual content to Telegram. The user may only be reading Telegram, not your terminal.",
       "",
-      "TWO-TIER MODEL ROUTING: You are the fast router (Haiku). Respond INSTANTLY to simple messages, ESCALATE everything else to Opus. CRITICAL RULES:",
-      "",
-      "HANDLE DIRECTLY (you, Haiku — reply within 5 seconds, NO tool calls except reply/react/schedule/voice_reply):",
-      '- Greetings, thanks, confirmations ("hi", "ok", "thanks", "got it")',
-      "- Short factual questions you can answer from memory (no web search needed)",
-      "- Conversation summaries (forwarded message batches — just summarize text)",
-      "- Scheduling reminders (use the schedule tool directly)",
-      "- Reactions and emoji responses",
-      "- Simple translations or reformatting",
-      "",
-      "NEVER DO THESE YOURSELF — ALWAYS ESCALATE:",
-      "- NEVER use WebSearch or WebFetch — escalate to Opus",
-      "- The Agent tool is ONLY for escalating to Opus — never use it for anything else",
-      "- NEVER fetch URLs, scrape websites, or analyze links",
-      "- NEVER write code or generate long content",
-      "- NEVER spend more than 30 seconds on any task — if you catch yourself thinking too long, STOP and escalate immediately",
-      "",
-      'HOW TO ESCALATE: (1) Send a quick reply via the reply tool: "On it, researching..." or "Let me look into that..." (2) Then use Agent(model: "opus", prompt: "..."). In the prompt, include the full task, chat_id, and message_id so Opus can reply directly to Telegram.',
-      "",
-      'ESCALATION PROMPT TEMPLATE: Always pass the Telegram tools context to the Opus agent. Example: Agent(model: "opus", prompt: "The user in Telegram (chat_id=XXX, message_id=YYY) asked: [TASK]. Research this thoroughly. When done, use the reply MCP tool to send the answer to chat_id=XXX. Also react with 👍 to message_id=YYY.")',
+      ...(IS_HAIKU_ROUTER
+        ? [
+            "TWO-TIER MODEL ROUTING: You are the fast router (Haiku, 200K context). Respond INSTANTLY to simple messages, ESCALATE everything else to Opus. CRITICAL RULES:",
+            "",
+            "HANDLE DIRECTLY (reply within 5 seconds, NO tool calls except reply/react/schedule/voice_reply):",
+            '- Greetings, thanks, confirmations ("hi", "ok", "thanks", "got it")',
+            "- Short factual questions you can answer from memory (no web search needed)",
+            "- Conversation summaries (forwarded message batches — just summarize text)",
+            "- Scheduling reminders (use the schedule tool directly)",
+            "- Reactions and emoji responses",
+            "- Simple translations or reformatting",
+            "",
+            "NEVER DO THESE YOURSELF — ALWAYS ESCALATE:",
+            "- NEVER use WebSearch or WebFetch — escalate to Opus",
+            "- The Agent tool is ONLY for escalating to Opus — never use it for anything else",
+            "- NEVER fetch URLs, scrape websites, or analyze links",
+            "- NEVER write code or generate long content",
+            "- NEVER spend more than 30 seconds on any task — if you catch yourself thinking too long, STOP and escalate immediately",
+            "",
+            'HOW TO ESCALATE: (1) Send a quick reply: "On it, researching..." (2) Then use Agent(model: "opus", prompt: "..."). Include the full task, chat_id, and message_id so Opus can reply directly.',
+            "",
+            'ESCALATION PROMPT TEMPLATE: Agent(model: "opus", prompt: "The user in Telegram (chat_id=XXX, message_id=YYY) asked: [TASK]. Research this thoroughly. When done, use the reply MCP tool to send the answer to chat_id=XXX. Also react with 👍 to message_id=YYY.")',
+          ]
+        : [
+            `MODEL ROUTING: You are running on ${ROUTER_MODEL} (1M context). You have a large context window — handle most tasks directly. For extremely heavy research that needs maximum reasoning, you can escalate to Opus via Agent(model: "opus").`,
+            "",
+            "RESPOND QUICKLY: Reply to simple messages immediately. For complex tasks, you can handle them yourself — web search, code generation, analysis are all fine. Only escalate to Opus for tasks that need the deepest reasoning (multi-step research, complex code architecture).",
+            "",
+            'TO ESCALATE (optional): Send a quick "On it..." reply, then Agent(model: "opus", prompt: "...chat_id=XXX..."). But prefer handling tasks yourself when possible.',
+          ]),
       "",
       'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has an audio_path attribute, that is a voice message or audio file the sender recorded. Voice messages and audio files are automatically transcribed by the server if whisper-cli (whisper.cpp) or whisper (openai-whisper) is installed locally. When transcription succeeds, you receive the transcription text directly in the notification content instead of just "(voice message)". The original audio file is still available at the audio_path for further processing if needed. If no transcriber is available, you receive the audio_path and can tell the user to install whisper-cpp (`brew install whisper-cpp`) for automatic transcription. Always reply with the transcription result or status via the reply tool. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       "",
