@@ -15,12 +15,17 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import {
+	closeSync,
 	existsSync,
 	mkdirSync,
+	openSync,
 	readFileSync,
+	readSync,
 	rmSync,
+	statSync,
 	unwatchFile,
 	watchFile,
+	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -29,12 +34,16 @@ const STATE_DIR = join(homedir(), ".claude", "channels", "telegram");
 const DATA_DIR = join(STATE_DIR, "data");
 const SIGNAL_FILE = join(DATA_DIR, "restart.signal");
 const CLAUDE_CMD = "claude";
+// Router model: configurable via TELEGRAM_ROUTER_MODEL env var.
+// Options: "haiku" (fast, 200K context), "sonnet" (balanced, 1M context), "opus" (deep, 1M context)
+// Default: "sonnet" — best balance of speed and context window.
+const ROUTER_MODEL = process.env.TELEGRAM_ROUTER_MODEL || "sonnet";
 const BASE_ARGS = [
 	"--channels",
 	"plugin:telegram@claude-plugins-official",
 	"--dangerously-skip-permissions",
 	"--model",
-	"haiku",
+	ROUTER_MODEL,
 ];
 
 // Extra args passed to this supervisor are forwarded to claude
@@ -44,6 +53,9 @@ const BACKOFF_BASE_MS = 1000;
 const BACKOFF_MAX_MS = 30_000;
 const STABLE_UPTIME_MS = 60_000;
 const GRACEFUL_TIMEOUT_MS = 5_000;
+const CONTEXT_CHECK_INTERVAL_MS = 30_000; // Check context every 30s
+const CONTEXT_THRESHOLD_PCT = 70; // Auto-restart when context exceeds 70%
+const STDOUT_LOG = join(DATA_DIR, "supervisor-stdout.log");
 // Delay before restart to let Claude finish sending Telegram replies
 const RESTART_DELAY_MS = 3_000;
 
@@ -284,11 +296,57 @@ async function cleanupOrphans(): Promise<void> {
 	}
 }
 
+// ── Context watchdog ──────────────────────────────────────────────
+// Monitors the stdout log for context usage percentage.
+// When it exceeds CONTEXT_THRESHOLD_PCT, triggers a graceful restart
+// to prevent the session from becoming unresponsive.
+
+let contextWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+let lastWatchdogTrigger = 0;
+
+function startContextWatchdog(): void {
+	if (contextWatchdogTimer) return;
+	contextWatchdogTimer = setInterval(() => {
+		if (!currentChild || shuttingDown) return;
+		// Debounce: don't trigger more than once per 60 seconds
+		if (Date.now() - lastWatchdogTrigger < 60_000) return;
+		try {
+			// Read the last 2KB of the stdout log to find the context percentage
+			const stat = statSync(STDOUT_LOG);
+			const readSize = Math.min(stat.size, 2048);
+			const fd = openSync(STDOUT_LOG, "r");
+			const buf = Buffer.alloc(readSize);
+			readSync(fd, buf, 0, readSize, stat.size - readSize);
+			closeSync(fd);
+			const tail = buf.toString("utf-8");
+
+			// Match the status bar pattern: ░█ blocks followed by percentage
+			// This avoids false positives from message content like "I'm 85% sure"
+			const matches = [...tail.matchAll(/[█░]+\s+(\d{1,3})%/g)];
+			if (matches.length === 0) return;
+
+			// Take the last percentage found (most recent status bar)
+			const lastPct = Number.parseInt(matches[matches.length - 1][1], 10);
+			if (lastPct >= CONTEXT_THRESHOLD_PCT && lastPct <= 100) {
+				log(`context watchdog: usage at ${lastPct}% (threshold: ${CONTEXT_THRESHOLD_PCT}%) — triggering restart`);
+				lastWatchdogTrigger = Date.now();
+				// Write a restart signal so handleRestartSignal picks it up
+				mkdirSync(join(SIGNAL_FILE, ".."), { recursive: true });
+				writeFileSync(SIGNAL_FILE, String(Date.now() + 2000));
+			}
+		} catch {
+			// Ignore read errors — file might not exist yet
+		}
+	}, CONTEXT_CHECK_INTERVAL_MS);
+}
+
 // Main
 log("telegram daemon supervisor starting");
+log(`router model: ${ROUTER_MODEL} (set TELEGRAM_ROUTER_MODEL to change)`);
 log(`signal file: ${SIGNAL_FILE}`);
 log(`claude args: ${[...BASE_ARGS, ...EXTRA_ARGS].join(" ")}`);
 startWatching();
+startContextWatchdog();
 void cleanupOrphans().then(() => {
 	startClaude();
 });
