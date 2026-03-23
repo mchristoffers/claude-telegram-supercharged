@@ -1075,6 +1075,8 @@ const mcp = new Server(
       "",
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, edit_message to update a message you previously sent (e.g. progress → result), and ask_user to present inline buttons and wait for a choice.',
       "",
+      'BATCHED MESSAGES: When multiple messages arrive quickly (e.g. forwarded conversation), they are combined into one notification with batch_size in the meta. Messages are numbered [1], [2], etc. IMPORTANT: For batched forwarded conversations, respond IMMEDIATELY with a brief summary of the conversation and ask if the user needs help with anything specific. Do NOT auto-research every link in the batch — just summarize the conversation content and offer to help. Only fetch URLs if the user explicitly asks you to.',
+      "",
       'When the user reacts with an emoji to a bot message, you receive a channel notification with event_type "reaction" containing the emoji and message_id. Use this as feedback (e.g. 👍 = approve, 👎 = reject).',
       "",
       "ask_user sends a message with inline keyboard buttons and blocks until the user taps one (or timeout). Use it when you need confirmation or a choice between options. The buttons are removed after the user taps.",
@@ -2211,7 +2213,7 @@ bot.on("message_reaction", async (ctx) => {
 // collect them into a batch and send ONE combined notification to Claude.
 // This prevents Claude from responding to each message individually.
 
-const BATCH_WINDOW_MS = 3000; // 3 seconds of silence before flushing
+const BATCH_WINDOW_MS = 5000; // 5 seconds of silence before flushing
 
 interface BatchedMessage {
   text: string;
