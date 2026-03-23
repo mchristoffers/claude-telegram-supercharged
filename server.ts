@@ -1659,9 +1659,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: "text", text: "TTS failed — ElevenLabs returned an error." }], isError: true };
         }
         // ElevenLabs returns OGG/Opus directly — no ffmpeg conversion needed
-        const sent = await bot.api.sendVoice(chat_id, new InputFile(audioPath), {
-          ...(reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
-        });
+        let sent: { message_id: number };
+        try {
+          sent = await bot.api.sendVoice(chat_id, new InputFile(audioPath), {
+            ...(reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
+          });
+        } catch (voiceErr) {
+          // Fallback: sendAudio if sendVoice is forbidden (privacy settings)
+          process.stderr.write(`telegram channel: sendVoice failed, trying sendAudio: ${voiceErr}\n`);
+          sent = await bot.api.sendAudio(chat_id, new InputFile(audioPath), {
+            title: "Voice reply",
+            ...(reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
+          });
+        }
         try {
           rmSync(audioPath);
         } catch {}
