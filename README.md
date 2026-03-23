@@ -40,17 +40,20 @@ Drop-in upgrade for the [official Claude Code Telegram plugin](https://github.co
 | **💬 Message History** | SQLite-backed rolling store. Claude has context across restarts. `get_history` + `search_messages` tools. No more "what were we talking about?" |
 | **🧵 Conversation Threading** | Claude follows reply chains in groups, sees who said what, responds in the correct thread. Up to 3 levels deep. |
 | **📋 Forum Topics** | Telegram Forum topics fully supported. Each topic is isolated -- `thread_id` persists in SQLite across restarts. |
-| **🎨 MarkdownV2 Formatting** | Bold, italic, code blocks, links render properly. `parse_mode` support (MarkdownV2/HTML/plain). |
+| **🎨 MarkdownV2 Auto-escaping** | Bold, italic, code blocks, links render properly. Special characters are auto-escaped server-side -- Claude writes natural text, no manual `\.` escaping needed. |
 | **🎯 Inline Buttons** | `ask_user` tool -- send questions with tappable buttons, wait for choice. Perfect for confirmations and approvals. |
 | **😎 Sticker & GIF Support** | Claude actually sees stickers and GIFs. Static stickers as images, animated ones as multi-frame collages. |
-| **👍 Reaction Status** | Visual processing status: 👀 read → 🔥 working → 👍 done. Plus expressive reactions for standout messages. |
+| **👍 Reaction Status** | Visual processing status: 👀 read → 🔥 working → 👍 done. Voice messages get ✍ instantly to signal transcription in progress. Plus expressive reactions for standout messages. |
 | **✅ Reaction Validation** | Client-side emoji whitelist prevents cryptic Telegram API errors. |
 | **👥 Group Pairing** | Add bot to group, mention it, get pairing code. No hunting for numeric chat IDs. |
 | **🔒 Shell Injection Protection** | All subprocess calls use `spawnSync` with array args. No shell interpretation of file paths. |
 | **🧹 Session Management** | `clear_history` + `save_memory` tools. Clean up with context preservation. |
-| **📰 Telegraph Instant View** | Long research, articles, and analyses are published to telegra.ph and sent as Instant View links. Full Markdown formatting, code blocks, images -- native article reader inside Telegram. |
+| **📰 Telegraph Instant View** | Long research (3000+ chars) published to telegra.ph as Instant View articles. Disabled by default -- opt-in via `TELEGRAPH_ENABLED=true`. |
 | **🔄 Daemon Mode** | Supervisor script auto-restarts Claude on crash or context reset. Say "clear everything" in Telegram and Claude restarts with a fresh session -- memory preserved, zero downtime. |
+| **🔒 Single-Instance Lock** | PID-based lock file prevents two bot instances from competing for Telegram updates. Stale locks auto-detected and cleaned up. |
 | **📊 Smart Caching** | Voice/audio files cached between middleware and handlers. No double downloads, no double transcriptions. |
+| **🖥 Daemon Management** | `/telegram:daemon start\|stop\|restart\|status\|logs` -- full lifecycle management. `/telegram:monitor` for health dashboard with remote control URL. |
+| **📸 Headless Screenshots** | `/screenshot` skill uses Playwright to capture web pages headlessly -- works in daemon mode where Chrome isn't available. |
 
 ## Getting Started
 
