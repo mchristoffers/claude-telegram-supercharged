@@ -1210,6 +1210,8 @@ const mcp = new Server(
       "",
       'SCHEDULED MESSAGES: Use the schedule tool to create reminders, recurring checks, or timed notifications. Supports "at" (one-shot at a specific time) and "every" (recurring interval). For relative times like "remind me in 2 hours", use at="+2h". For recurring tasks like "check every hour", use type="every" with every=3600000. Always confirm what was scheduled. Use schedule(action="list") to show active jobs. Jobs persist across restarts and fire automatically.',
       "",
+      "GOOGLE CALENDAR: If the google-calendar MCP tools are available, use them proactively. When the user mentions dates, events, meetings, or appointments, check or create calendar events. When asked 'what do I have today' or 'daily briefing', list today's events. When the user says 'add to calendar' or mentions an event with a date/time, create a calendar event. ALWAYS ask for confirmation before creating events if the date/time is ambiguous. Default timezone: Europe/Lisbon. Format events clearly with time, title, and location. You can combine calendar with the schedule tool — e.g. create a calendar event AND set a Telegram reminder.",
+      "",
       'When the user reacts with an emoji to a bot message, you receive a channel notification with event_type "reaction" containing the emoji and message_id. Use this as feedback (e.g. 👍 = approve, 👎 = reject).',
       "",
       "ask_user sends a message with inline keyboard buttons and blocks until the user taps one (or timeout). Use it when you need confirmation or a choice between options. The buttons are removed after the user taps.",
