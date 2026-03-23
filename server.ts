@@ -1202,6 +1202,8 @@ const mcp = new Server(
       "",
       'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has an audio_path attribute, that is a voice message or audio file the sender recorded. Voice messages and audio files are automatically transcribed by the server if whisper-cli (whisper.cpp) or whisper (openai-whisper) is installed locally. When transcription succeeds, you receive the transcription text directly in the notification content instead of just "(voice message)". The original audio file is still available at the audio_path for further processing if needed. If no transcriber is available, you receive the audio_path and can tell the user to install whisper-cpp (`brew install whisper-cpp`) for automatic transcription. Always reply with the transcription result or status via the reply tool. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       "",
+      "DOCUMENTS: If the tag has a document_path attribute, the user sent a file (PDF, DOCX, spreadsheet, etc.). Read the file to see its contents. PDFs and DOCX files are supported by the Read tool directly. For text-based files (CSV, TXT, JSON, code), Read them directly. For XLSX, suggest the user share as CSV or PDF. Always acknowledge the document and summarize what you found. Files >10MB are skipped.",
+      "",
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, edit_message to update a message you previously sent (e.g. progress → result), and ask_user to present inline buttons and wait for a choice.',
       "",
       "BATCHED MESSAGES: When multiple messages arrive quickly (e.g. forwarded conversation), they are combined into one notification with batch_size in the meta. Messages are numbered [1], [2], etc. IMPORTANT: For batched forwarded conversations, respond IMMEDIATELY with a brief summary of the conversation and ask if the user needs help with anything specific. Do NOT auto-research every link in the batch — just summarize the conversation content and offer to help. Only fetch URLs if the user explicitly asks you to.",
@@ -2380,11 +2382,13 @@ bot.on("message", async (ctx, next) => {
         ? "voice"
         : msg.audio
           ? "audio"
-          : msg.sticker
-            ? "sticker"
-            : msg.animation
-              ? "animation"
-              : undefined;
+          : msg.document
+            ? "document"
+            : msg.sticker
+              ? "sticker"
+              : msg.animation
+                ? "animation"
+                : undefined;
 
     // Auto-transcribe voice/audio for history — even if the bot isn't mentioned.
     // Opt-out via `"autoTranscribe": false` in access.json.
@@ -2590,6 +2594,37 @@ bot.on("message:animation", async (ctx) => {
   });
 });
 
+bot.on("message:document", async (ctx) => {
+  const doc = ctx.message.document;
+  const caption = ctx.message.caption ?? `(document: ${doc.file_name ?? "file"})`;
+  await handleInbound(ctx, caption, async () => {
+    try {
+      // Skip files >10MB to avoid filling disk
+      if (doc.file_size && doc.file_size > 10 * 1024 * 1024) {
+        process.stderr.write(
+          `telegram channel: document too large (${(doc.file_size / 1024 / 1024).toFixed(1)}MB) — skipping\n`,
+        );
+        return undefined;
+      }
+      const file = await ctx.api.getFile(doc.file_id);
+      if (!file.file_path) return undefined;
+      const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`download failed: ${res.status}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      // Preserve original filename for Claude to identify the file type
+      const origName = doc.file_name ?? `doc-${doc.file_unique_id}`;
+      const path = join(INBOX_DIR, `${Date.now()}-${origName}`);
+      mkdirSync(INBOX_DIR, { recursive: true });
+      writeFileSync(path, buf);
+      return { path, type: "document" as const };
+    } catch (err) {
+      process.stderr.write(`telegram channel: document download failed: ${err}\n`);
+      return undefined;
+    }
+  });
+});
+
 // Handle inline keyboard button taps (ask_user responses).
 bot.on("callback_query:data", async (ctx) => {
   const data = ctx.callbackQuery.data;
@@ -2680,7 +2715,7 @@ interface BatchedMessage {
   username: string;
   userId: string;
   timestamp: Date;
-  media?: { path: string; type: "image" | "audio" };
+  media?: { path: string; type: "image" | "audio" | "document" };
   threadId?: number;
   replyContext: Record<string, string>;
   isGroup: boolean;
@@ -2729,6 +2764,7 @@ function flushBatch(chatId: string): void {
   // Collect all media paths
   const imagePaths = msgs.filter((m) => m.media?.type === "image").map((m) => m.media!.path);
   const audioPaths = msgs.filter((m) => m.media?.type === "audio").map((m) => m.media!.path);
+  const docPaths = msgs.filter((m) => m.media?.type === "document").map((m) => m.media!.path);
 
   // Use the last message's context for thread tracking
   const recentHistory = messageStore.formatRecent(chatId, 5);
@@ -2757,6 +2793,8 @@ function flushBatch(chatId: string): void {
         ...(imagePaths.length > 0 ? { image_path: imagePaths[0] } : {}),
         ...(imagePaths.length > 1 ? { image_paths: imagePaths.join(",") } : {}),
         ...(audioPaths.length > 0 ? { audio_path: audioPaths[0] } : {}),
+        ...(docPaths.length > 0 ? { document_path: docPaths[0] } : {}),
+        ...(docPaths.length > 1 ? { document_paths: docPaths.join(",") } : {}),
         ...(last.threadId != null ? { thread_id: String(last.threadId) } : {}),
         ...last.replyContext,
         ...threadChainContext,
@@ -2769,7 +2807,7 @@ async function handleInbound(
   ctx: Context,
   inboundText: string,
   downloadMedia:
-    | (() => Promise<{ path: string; type: "image" | "audio"; transcription?: string } | undefined>)
+    | (() => Promise<{ path: string; type: "image" | "audio" | "document"; transcription?: string } | undefined>)
     | undefined,
 ): Promise<void> {
   const result = gate(ctx);
