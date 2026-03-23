@@ -51,6 +51,8 @@ Drop-in upgrade for the [official Claude Code Telegram plugin](https://github.co
 | **📰 Telegraph Instant View** | Long research (3000+ chars) published to telegra.ph as Instant View articles. Disabled by default -- opt-in via `TELEGRAPH_ENABLED=true`. |
 | **🔄 Daemon Mode** | Supervisor script auto-restarts Claude on crash or context reset. Say "clear everything" in Telegram and Claude restarts with a fresh session -- memory preserved, zero downtime. |
 | **🔒 Single-Instance Lock** | PID-based lock file prevents two bot instances from competing for Telegram updates. Stale locks auto-detected and cleaned up. |
+| **📨 Forwarded Messages** | Full forwarding context preserved -- Claude sees who originally sent it and from which chat/channel. |
+| **📦 Message Batching** | Forward 20+ messages at once -- they're collected into one batch (5s debounce), auto-summarized instantly, then Claude responds to the whole conversation in one reply. |
 | **📊 Smart Caching** | Voice/audio files cached between middleware and handlers. No double downloads, no double transcriptions. |
 | **🖥 Daemon Management** | `/telegram:daemon start\|stop\|restart\|status\|logs` -- full lifecycle management. `/telegram:monitor` for health dashboard with remote control URL. |
 | **📸 Headless Screenshots** | `/screenshot` skill uses Playwright to capture web pages headlessly -- works in daemon mode where Chrome isn't available. |
