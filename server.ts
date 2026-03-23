@@ -1884,12 +1884,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             humanTime = `${days} day${days !== 1 ? "s" : ""}`;
           }
 
-          const confirmMsg =
-            jobType === "at"
-              ? `Got it! I'll remind you in ${humanTime}.`
-              : `Got it! I'll repeat this every ${humanTime}.`;
-
-          void bot.api.sendMessage(chat_id, confirmMsg).catch(() => {});
+          // Note: Claude sends its own confirmation reply, so we don't send
+          // a server-side message to avoid duplicate confirmations.
 
           return {
             content: [
