@@ -700,6 +700,14 @@ class MessageStore {
     return `[Recent history — last ${msgs.length} messages]\n${lines.join("\n")}`;
   }
 
+  /** Look up a message's text by its message_id and chat_id. Used as fallback when reply_to_message.text is empty. */
+  getByMessageId(chatId: string, messageId: number): string | undefined {
+    const row = this.db
+      .query("SELECT text FROM messages WHERE chat_id = ? AND message_id = ? LIMIT 1")
+      .get(chatId, messageId) as { text: string | null } | null;
+    return row?.text ?? undefined;
+  }
+
   /** Delete all messages for a chat. Returns the number of rows deleted. */
   clearHistory(chatId: string): number {
     const result = this.db.run("DELETE FROM messages WHERE chat_id = ?", [chatId]);
@@ -2915,9 +2923,30 @@ async function handleInbound(
   const replyContext: Record<string, string> = {};
   if (replyToMsg) {
     replyContext.reply_to_message_id = String(replyToMsg.message_id);
-    // Include text OR caption (forwarded messages often use caption instead of text)
-    const replyText = replyToMsg.text ?? replyToMsg.caption;
+
+    // Try multiple sources for the replied-to message text:
+    // 1. Telegram's reply_to_message.text or .caption
+    // 2. SQLite history (if the middleware stored it earlier)
+    // 3. quote.text (Telegram's partial quote feature)
+    let replyText = replyToMsg.text ?? replyToMsg.caption;
+
+    // Fallback: check SQLite history for the original message
+    if (!replyText && replyToMsg.message_id) {
+      const stored = messageStore.getByMessageId(chat_id, replyToMsg.message_id);
+      if (stored) {
+        replyText = stored;
+        process.stderr.write("telegram channel: reply_to text recovered from SQLite history\n");
+      }
+    }
+
+    // Fallback: check Telegram's quote feature (partial quote)
+    const quote = (ctx.message as any)?.quote;
+    if (!replyText && quote?.text) {
+      replyText = quote.text;
+    }
+
     if (replyText) replyContext.reply_to_text = replyText.slice(0, 1000);
+
     if (replyToMsg.from) {
       replyContext.reply_to_user = replyToMsg.from.username ?? String(replyToMsg.from.id);
     }
