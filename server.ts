@@ -972,6 +972,7 @@ function pruneExpired(a: Access): boolean {
 type GateResult =
   | { action: "deliver"; access: Access }
   | { action: "drop" }
+  | { action: "buffer"; access: Access }
   | { action: "pair"; code: string; isResend: boolean };
 
 function gate(ctx: Context): GateResult {
@@ -1055,7 +1056,10 @@ function gate(ctx: Context): GateResult {
       return { action: "drop" };
     }
     if (requireMention && !isMentioned(ctx, access.mentionPatterns)) {
-      return { action: "drop" };
+      // Don't drop immediately — buffer the message so a mention arriving
+      // within the batch window can retroactively promote it. This lets
+      // "forward 3 PDFs + one text with @bot" work as a single batch.
+      return { action: "buffer", access };
     }
     return { action: "deliver", access };
   }
@@ -2729,6 +2733,48 @@ bot.on("message_reaction", async (ctx) => {
   });
 });
 
+// ── Pre-gate buffer for group messages without mention ──────────────
+// When `requireMention` is true in a group, messages without a mention
+// aren't dropped immediately. Instead they're buffered here. If a
+// mention arrives from the same chat within BATCH_WINDOW_MS, all
+// buffered messages are promoted into the delivery batch. If the window
+// expires with no mention, the buffer is silently discarded.
+//
+// This solves the "forward 3 PDFs then @bot analyze them" pattern where
+// the PDFs arrive as separate messages without a mention.
+
+interface BufferedCtx {
+  ctx: Context;
+  inboundText: string;
+  downloadMedia:
+    | (() => Promise<{ path: string; type: "image" | "audio" | "document"; transcription?: string } | undefined>)
+    | undefined;
+  access: Access;
+}
+
+const pregateBuffers = new Map<string, { messages: BufferedCtx[]; timer: ReturnType<typeof setTimeout> }>();
+const MAX_PREGATE_BUFFER = 20;
+
+function discardPregateBuffer(chatId: string): void {
+  const buf = pregateBuffers.get(chatId);
+  if (buf) {
+    process.stderr.write(`telegram channel: discarded ${buf.messages.length} unbuffered message(s) from chat ${chatId}\n`);
+    clearTimeout(buf.timer);
+    pregateBuffers.delete(chatId);
+  }
+}
+
+async function promotePregateBuffer(chatId: string): Promise<void> {
+  const buf = pregateBuffers.get(chatId);
+  if (!buf) return;
+  clearTimeout(buf.timer);
+  pregateBuffers.delete(chatId);
+  // Deliver each buffered message through the normal post-gate path.
+  for (const entry of buf.messages) {
+    await deliverMessage(entry.ctx, entry.inboundText, entry.downloadMedia, entry.access);
+  }
+}
+
 // ── Message batching ────────────────────────────────────────────────
 // When multiple messages arrive in quick succession (e.g. forwarded conversation),
 // collect them into a batch and send ONE combined notification to Claude.
@@ -2847,7 +2893,43 @@ async function handleInbound(
     return;
   }
 
-  const access = result.access;
+  if (result.action === "buffer") {
+    // Message passed all checks except requireMention. Hold it in the
+    // pre-gate buffer — if a mention arrives within BATCH_WINDOW_MS from
+    // the same chat, promotePregateBuffer() will deliver everything.
+    const chat_id = String(ctx.chat!.id);
+    const buf = pregateBuffers.get(chat_id);
+    if (buf) {
+      if (buf.messages.length >= MAX_PREGATE_BUFFER) return; // safety cap
+      clearTimeout(buf.timer);
+      buf.messages.push({ ctx, inboundText, downloadMedia, access: result.access });
+      buf.timer = setTimeout(() => discardPregateBuffer(chat_id), BATCH_WINDOW_MS);
+    } else {
+      pregateBuffers.set(chat_id, {
+        messages: [{ ctx, inboundText, downloadMedia, access: result.access }],
+        timer: setTimeout(() => discardPregateBuffer(chat_id), BATCH_WINDOW_MS),
+      });
+    }
+    return;
+  }
+
+  // action === "deliver" — first promote any buffered messages from this chat
+  const chat_id = String(ctx.chat!.id);
+  await promotePregateBuffer(chat_id);
+
+  await deliverMessage(ctx, inboundText, downloadMedia, result.access);
+}
+
+// ── Post-gate delivery: download media, build context, add to batch ──
+
+async function deliverMessage(
+  ctx: Context,
+  inboundText: string,
+  downloadMedia:
+    | (() => Promise<{ path: string; type: "image" | "audio" | "document"; transcription?: string } | undefined>)
+    | undefined,
+  access: Access,
+): Promise<void> {
   const from = ctx.from!;
   const chat_id = String(ctx.chat!.id);
   const msgId = ctx.message?.message_id;
