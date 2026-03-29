@@ -3132,6 +3132,65 @@ async function deliverMessage(
   }
 }
 
+// ── Replay unanswered messages after restart ─────────────────────────
+// After a watchdog restart, messages that were ACK'd (got 👀) but never
+// replied to are lost. This function checks SQLite for recent inbound DM
+// messages with no subsequent outbound reply and re-delivers them.
+function replayUnanswered(): void {
+  try {
+    const cutoff = Math.floor(Date.now() / 1000) - 300; // last 5 minutes
+    const access = loadAccess();
+    const allowedChats = access.allowFrom;
+    if (allowedChats.length === 0) return;
+
+    for (const chatId of allowedChats) {
+      // Get last 10 messages from this chat, newest first
+      const recent = messageStore.getHistory(chatId, 10);
+      if (recent.length === 0) continue;
+
+      // Find the last outbound (bot) message timestamp
+      const lastOutbound = recent.find((m) => m.is_outgoing === 1);
+      const lastOutboundDate = lastOutbound ? (lastOutbound.date as number) : 0;
+
+      // Collect inbound messages newer than last outbound AND within cutoff
+      const unanswered = recent.filter(
+        (m) => m.is_outgoing === 0 && (m.date as number) > lastOutboundDate && (m.date as number) >= cutoff,
+      );
+
+      if (unanswered.length === 0) continue;
+
+      // Replay as a single notification
+      const lines = unanswered
+        .reverse() // chronological order
+        .map((m) => (m.text as string) ?? "[media]")
+        .join("\n");
+
+      const last = unanswered[unanswered.length - 1];
+      process.stderr.write(
+        `telegram channel: replaying ${unanswered.length} unanswered message(s) in chat ${chatId}\n`,
+      );
+
+      void mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: unanswered.length > 1
+            ? `[Replayed ${unanswered.length} messages missed during restart]\n${lines}`
+            : lines,
+          meta: {
+            chat_id: chatId,
+            message_id: last.message_id != null ? String(last.message_id) : undefined,
+            user: (last.username as string) ?? String(last.user_id),
+            user_id: last.user_id != null ? String(last.user_id) : undefined,
+            ts: new Date((last.date as number) * 1000).toISOString(),
+          },
+        },
+      });
+    }
+  } catch (err) {
+    process.stderr.write(`telegram channel: replay check failed: ${err}\n`);
+  }
+}
+
 if (!isSecondary) {
   void bot.start({
     allowed_updates: [
@@ -3153,6 +3212,8 @@ if (!isSecondary) {
       ].filter(Boolean);
       process.stderr.write(`telegram channel: transcription chain: ${chain.length > 0 ? chain.join(" → ") : "none"}\n`);
       if (ELEVENLABS_API_KEY) process.stderr.write(`telegram channel: TTS: ElevenLabs (voice ${ELEVENLABS_VOICE_ID})\n`);
+      // Check for messages that were lost during the restart gap
+      setTimeout(replayUnanswered, 3000);
     },
   });
 } else {
