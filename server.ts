@@ -1653,10 +1653,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "react": {
         assertAllowedChat(args.chat_id as string);
         const emoji = args.emoji as string;
-        await bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
-          { type: "emoji", emoji: emoji as ReactionTypeEmoji["emoji"] },
-        ]);
-        return { content: [{ type: "text", text: "reacted" }] };
+        try {
+          await bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
+            { type: "emoji", emoji: emoji as ReactionTypeEmoji["emoji"] },
+          ]);
+          return { content: [{ type: "text", text: "reacted" }] };
+        } catch {
+          const allowed = [...ALLOWED_REACTIONS].join(" ");
+          return { content: [{ type: "text", text: `react failed: "${emoji}" not supported. Allowed: ${allowed}` }] };
+        }
       }
       case "edit_message": {
         assertAllowedChat(args.chat_id as string);
