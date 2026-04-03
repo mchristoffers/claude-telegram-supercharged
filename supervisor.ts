@@ -34,16 +34,10 @@ const STATE_DIR = join(homedir(), ".claude", "channels", "telegram");
 const DATA_DIR = join(STATE_DIR, "data");
 const SIGNAL_FILE = join(DATA_DIR, "restart.signal");
 const CLAUDE_CMD = "claude";
-// Router model: configurable via TELEGRAM_ROUTER_MODEL env var.
-// Options: "haiku" (fast, 200K context), "sonnet" (balanced, 1M context), "opus" (deep, 1M context)
-// Default: "sonnet" — best balance of speed and context window.
-const ROUTER_MODEL = process.env.TELEGRAM_ROUTER_MODEL || "sonnet";
 const BASE_ARGS = [
 	"--channels",
 	"plugin:telegram@claude-plugins-official",
 	"--dangerously-skip-permissions",
-	"--model",
-	ROUTER_MODEL,
 ];
 
 // Extra args passed to this supervisor are forwarded to claude
@@ -355,7 +349,6 @@ function startContextWatchdog(): void {
 
 // Main
 log("telegram daemon supervisor starting");
-log(`router model: ${ROUTER_MODEL} (set TELEGRAM_ROUTER_MODEL to change)`);
 log(`signal file: ${SIGNAL_FILE}`);
 log(`claude args: ${[...BASE_ARGS, ...EXTRA_ARGS].join(" ")}`);
 startWatching();
