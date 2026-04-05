@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "croner": "^10.0.1",
     "grammy": "^1.21.0"
   },
   "devDependencies": {
