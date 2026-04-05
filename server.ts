@@ -1250,7 +1250,7 @@ const mcp = new Server(
       "",
       'Messages use Telegram MarkdownV2 by default. Formatting: *bold*, _italic_, `code`, ```pre```, ~strikethrough~, __underline__, ||spoiler||, [link](url). Special characters are auto-escaped — do NOT manually escape with backslashes. Just write natural text with formatting markers and the server handles escaping. Use parse_mode "plain" if you want no formatting at all.',
       "",
-      "Message history is stored locally in SQLite. Use get_history(chat_id) to retrieve recent messages (up to 200) and search_messages(chat_id, query) to search by text. History is available from when the bot joined the chat and persists across restarts. The last 5 messages are auto-injected with each notification for context.",
+      "Message history is stored locally in SQLite. Use get_history(chat_id, limit) to retrieve recent messages (up to 200) and search_messages(chat_id, query) to search by text. History is available from when the bot joined the chat and persists across restarts. The last 15 messages are auto-injected with each notification for context. IMPORTANT: If you need more context than the 15 auto-injected messages (e.g. to recall earlier conversation, find a list that was sent, or understand a reference), proactively call get_history with a higher limit (up to 200). Don't tell the user the context is missing — just fetch it.",
       "",
       "THREADING IN GROUPS: In group chats, messages may include reply_to_message_id and reply_to_text/reply_to_user attributes showing what message was being replied to. Use this context to follow conversation threads. When you reply in a group, ALWAYS set reply_to to the message_id that triggered your response — this keeps conversations threaded in the Telegram UI. If a message has a thread_id attribute, it belongs to a Telegram Forum topic.",
       "",
@@ -2874,7 +2874,7 @@ function flushBatch(chatId: string): void {
   const docPaths = msgs.filter((m) => m.media?.type === "document").map((m) => m.media!.path);
 
   // Use the last message's context for thread tracking
-  const recentHistory = messageStore.formatRecent(chatId, 5);
+  const recentHistory = messageStore.formatRecent(chatId, 15);
   const content = recentHistory ? `${combinedText}\n\n${recentHistory}` : combinedText;
 
   // For group messages, include thread chain from the last message.
