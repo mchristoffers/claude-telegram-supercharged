@@ -700,7 +700,15 @@ class MessageStore {
       const content = m.text ?? (m.media_type ? `[${m.media_type}]` : "[no text]");
       return `[${ts}] ${sender}${replyTag}${topicTag}: ${(content as string).slice(0, 300)}`;
     });
-    return `[Recent history — last ${msgs.length} messages]\n${lines.join("\n")}`;
+    // Cap total history to ~6000 chars to avoid blowing context limits
+    let result = "";
+    let included = 0;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (result.length + lines[i].length > 6000) break;
+      result = lines[i] + "\n" + result;
+      included++;
+    }
+    return `[Recent history — last ${included} messages]\n${result.trimEnd()}`;
   }
 
   /** Look up a message's text by its message_id and chat_id. Used as fallback when reply_to_message.text is empty. */
