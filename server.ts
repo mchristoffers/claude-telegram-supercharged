@@ -598,26 +598,33 @@ function checkSchedules(): void {
   }
 }
 
-/** Check if supervisor requested a session save. Sends a trigger message to the main chat. */
+/** Check if supervisor requested a session save. Sends a direct MCP channel notification to Claude. */
 function checkSaveSessionSignal(): void {
   try {
     if (!existsSync(SAVE_SESSION_SIGNAL)) return;
-    const content = readFileSync(SAVE_SESSION_SIGNAL, "utf-8").trim();
-    // Get the primary chat ID from access config or recent messages
-    const chatId = content || "";
-    if (!chatId) {
-      // Try to find the main chat from schedules or recent activity
-      const jobs = loadSchedules();
-      const mainChat = jobs[0]?.chat_id;
-      if (!mainChat) return;
-      // Send a system message that Claude will see as an inbound notification
-      void bot.api.sendMessage(mainChat, "🔄 SESSION_SAVE_REQUESTED: Session restart imminent. Please call save_session now with an updated SESSION.md.").catch(() => {});
-    } else {
-      void bot.api.sendMessage(chatId, "🔄 SESSION_SAVE_REQUESTED: Session restart imminent. Please call save_session now with an updated SESSION.md.").catch(() => {});
-    }
+    const chatId = readFileSync(SAVE_SESSION_SIGNAL, "utf-8").trim() || "system";
+
+    // Send directly as MCP channel notification — Claude sees this immediately
+    void mcp.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: "SESSION_SAVE_REQUESTED: Session restart is imminent. Call save_session NOW with an updated SESSION.md. Read the current SESSION.md first (if it exists), merge your session knowledge, compress older epochs, and write the result. You have ~10 seconds before the process is killed.",
+        meta: {
+          chat_id: chatId,
+          user: "supervisor",
+          user_id: "system",
+          ts: new Date().toISOString(),
+          event_type: "session_save",
+        },
+      },
+    });
+
     // Remove signal — supervisor will wait then proceed with kill
     rmSync(SAVE_SESSION_SIGNAL, { force: true });
-  } catch {}
+    process.stderr.write(`telegram channel: session save signal consumed, notification sent\n`);
+  } catch (err) {
+    process.stderr.write(`telegram channel: checkSaveSessionSignal error: ${err}\n`);
+  }
 }
 
 // Start the schedule checker loop (every 30 seconds) + session save signal check
