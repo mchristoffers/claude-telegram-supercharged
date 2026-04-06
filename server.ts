@@ -2564,6 +2564,9 @@ function cacheMedia(uniqueId: string, path: string, transcription?: string): voi
 bot.on("message", async (ctx, next) => {
   const msg = ctx.message;
   if (msg) {
+    // Auto-react with 👀 to confirm message was received
+    void ctx.api.setMessageReaction(msg.chat.id, msg.message_id, [{ type: "emoji", emoji: "👀" }]).catch(() => {});
+
     const from = msg.from;
     let text: string | undefined = msg.text ?? msg.caption ?? undefined;
     const mediaType = msg.photo
