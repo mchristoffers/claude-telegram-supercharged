@@ -3344,7 +3344,6 @@ if (!isSecondary) {
         { command: "schedules", description: "Geplante Jobs auflisten" },
         { command: "newschedule", description: "Neuen Schedule/Reminder erstellen" },
         { command: "deleteschedule", description: "Schedule löschen" },
-        { command: "weather", description: "Aktuelles Wetter abfragen" },
         { command: "status", description: "Bot-Status anzeigen" },
       ]).catch((err) => process.stderr.write(`telegram channel: setMyCommands failed: ${err}\n`));
 
