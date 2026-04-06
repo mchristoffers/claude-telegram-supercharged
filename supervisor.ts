@@ -121,6 +121,13 @@ async function startClaude(): Promise<void> {
 		restartCount = 0;
 	}
 
+	// Brute-force kill any remaining bun server.ts processes
+	try {
+		const { execSync } = require("node:child_process");
+		execSync("pkill -9 -f 'bun server.ts' || true; pkill -9 -f 'bun run.*--silent start' || true", { encoding: "utf-8" });
+		log("killed all bun server.ts processes");
+	} catch {}
+
 	lastStartTime = Date.now();
 	const args = [...BASE_ARGS, ...EXTRA_ARGS];
 	log(`spawning: ${CLAUDE_CMD} ${args.join(" ")}`);
