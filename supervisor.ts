@@ -110,11 +110,11 @@ async function killChild(child: ChildProcess): Promise<void> {
 	});
 }
 
-function startClaude(): void {
+async function startClaude(): Promise<void> {
 	if (shuttingDown) return;
 
-	// Kill any orphaned MCP server processes before starting fresh
-	void cleanupOrphans();
+	// Kill any orphaned MCP server processes before starting fresh — WAIT for completion
+	await cleanupOrphans();
 
 	const uptime = Date.now() - lastStartTime;
 	if (lastStartTime > 0 && uptime > STABLE_UPTIME_MS) {
