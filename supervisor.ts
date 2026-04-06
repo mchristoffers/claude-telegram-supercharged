@@ -111,6 +111,9 @@ async function killChild(child: ChildProcess): Promise<void> {
 function startClaude(): void {
 	if (shuttingDown) return;
 
+	// Kill any orphaned MCP server processes before starting fresh
+	void cleanupOrphans();
+
 	const uptime = Date.now() - lastStartTime;
 	if (lastStartTime > 0 && uptime > STABLE_UPTIME_MS) {
 		restartCount = 0;
@@ -234,26 +237,43 @@ async function shutdown(sig: string): Promise<void> {
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
-// Kill any orphaned claude --channels telegram processes from previous runs
+// Kill any orphaned claude and MCP server processes from previous runs
 async function cleanupOrphans(): Promise<void> {
 	const { execSync } = await import("node:child_process");
 	try {
 		const myPid = process.pid;
-		// Find claude processes with telegram channel flag, excluding our own PID
-		const result = execSync(
-			`pgrep -f 'claude.*--channels.*telegram' || true`,
-			{ encoding: "utf-8" },
-		).trim();
-		if (!result) return;
 
-		const pids = result
-			.split("\n")
-			.map((p) => Number.parseInt(p.trim(), 10))
-			.filter((p) => !Number.isNaN(p) && p !== myPid);
+		// Find orphaned claude processes AND stale bun server.ts (MCP) processes
+		const patterns = [
+			"claude.*--channels.*telegram",
+			"bun server\\.ts",
+			"bun run.*--silent start",
+		];
+		const allPids: number[] = [];
+
+		for (const pattern of patterns) {
+			const result = execSync(
+				`pgrep -f '${pattern}' || true`,
+				{ encoding: "utf-8" },
+			).trim();
+			if (!result) continue;
+
+			const pids = result
+				.split("\n")
+				.map((p) => Number.parseInt(p.trim(), 10))
+				.filter((p) => !Number.isNaN(p) && p !== myPid);
+
+			allPids.push(...pids);
+		}
+
+		if (allPids.length === 0) return;
+
+		// Deduplicate
+		const uniquePids = [...new Set(allPids)];
 
 		// Filter out interactive sessions (processes with a TTY are user terminals)
 		const orphanPids: number[] = [];
-		for (const pid of pids) {
+		for (const pid of uniquePids) {
 			try {
 				const tty = execSync(`ps -p ${pid} -o tty=`, {
 					encoding: "utf-8",
