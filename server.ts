@@ -574,11 +574,28 @@ function checkSchedules(): void {
   for (const job of jobs) {
     const fireTime = new Date(job.next_fire).getTime();
     if (fireTime <= now) {
-      // Fire the job — send a clean single-line reminder
+      // Fire the job — send a short reminder to Telegram
       const reminderText = job.label && job.label !== job.text ? `⏰ ${job.label}` : `⏰ ${job.text}`;
       void bot.api.sendMessage(job.chat_id, reminderText).catch((err) => {
         process.stderr.write(`telegram channel: schedule fire failed: ${err}\n`);
       });
+
+      // Also push the full task text as MCP channel notification so Claude actually executes it
+      void mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: `SCHEDULED TASK FIRED (${job.label || job.id}): ${job.text}`,
+          meta: {
+            chat_id: job.chat_id,
+            user: "scheduler",
+            user_id: "system",
+            ts: new Date().toISOString(),
+            event_type: "schedule_fire",
+          },
+        },
+      });
+      process.stderr.write(`telegram channel: schedule fired → MCP notification sent for "${job.label || job.id}"\n`);
+
       changed = true;
 
       if (job.one_shot) {
