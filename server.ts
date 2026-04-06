@@ -564,6 +564,10 @@ function computeNextFire(job: ScheduledJob): string {
   return job.next_fire;
 }
 
+// Track recently fired jobs to prevent duplicate fires
+const recentlyFired = new Map<string, number>(); // job.id → timestamp
+const FIRE_COOLDOWN_MS = 120_000; // 2 minutes cooldown between fires of same job
+
 /** Check and fire due scheduled jobs. Called every 30s by the timer loop. */
 function checkSchedules(): void {
   const jobs = loadSchedules();
@@ -571,9 +575,26 @@ function checkSchedules(): void {
   const toKeep: ScheduledJob[] = [];
   let changed = false;
 
+  // Clean up old entries from recentlyFired
+  for (const [id, ts] of recentlyFired) {
+    if (now - ts > FIRE_COOLDOWN_MS) recentlyFired.delete(id);
+  }
+
   for (const job of jobs) {
     const fireTime = new Date(job.next_fire).getTime();
     if (fireTime <= now) {
+      // Deduplicate: skip if this job fired recently
+      if (recentlyFired.has(job.id)) {
+        // Still remove one-shot jobs even if skipped
+        if (!job.one_shot) {
+          job.next_fire = computeNextFire(job);
+          toKeep.push(job);
+        }
+        changed = true;
+        continue;
+      }
+      recentlyFired.set(job.id, now);
+
       // Fire the job — send a short reminder to Telegram
       const reminderText = job.label && job.label !== job.text ? `⏰ ${job.label}` : `⏰ ${job.text}`;
       void bot.api.sendMessage(job.chat_id, reminderText).catch((err) => {
