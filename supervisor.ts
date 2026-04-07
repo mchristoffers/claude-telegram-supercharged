@@ -120,23 +120,26 @@ async function killChild(child: ChildProcess): Promise<void> {
 	});
 }
 
-// ── Persisted effort level (model selection) ──────────────────────
-// Read from EFFORT_FILE to decide which --model flag to append on spawn.
-// low → haiku, medium → sonnet (default), high → opus.
-function effortToModelArgs(): string[] {
+// ── Persisted effort level ─────────────────────────────────────────
+// Read from EFFORT_FILE to decide which --effort flag to append on spawn.
+// Claude CLI supports: low | medium | high | max.
+// "auto" is a Telegram-only sentinel meaning "don't pass --effort at all"
+// (= use Claude's default classifier behavior).
+function effortToCliArgs(): string[] {
 	try {
 		const raw = readFileSync(EFFORT_FILE, "utf-8");
 		const data = JSON.parse(raw) as { effort?: string };
-		switch (data.effort) {
-			case "low":
-				return ["--model", "claude-haiku-4-5-20251001"];
-			case "medium":
-				return ["--model", "claude-sonnet-4-6"];
-			case "high":
-				return ["--model", "claude-opus-4-6"];
+		if (
+			data.effort === "low" ||
+			data.effort === "medium" ||
+			data.effort === "high" ||
+			data.effort === "max"
+		) {
+			return ["--effort", data.effort];
 		}
+		// "auto" or anything else → no flag
 	} catch {
-		// File missing or invalid — fall through to default
+		// File missing or invalid — fall through to no flag
 	}
 	return [];
 }
@@ -174,8 +177,8 @@ async function startClaude(): Promise<void> {
 	} catch {}
 
 	lastStartTime = Date.now();
-	const modelArgs = effortToModelArgs();
-	const args = [...BASE_ARGS, ...modelArgs, ...EXTRA_ARGS];
+	const effortArgs = effortToCliArgs();
+	const args = [...BASE_ARGS, ...effortArgs, ...EXTRA_ARGS];
 	log(`spawning: ${CLAUDE_CMD} ${args.join(" ")}`);
 	// Use `expect` wrapper to allocate a PTY and auto-accept the workspace trust dialog.
 	// expect spawns Claude with a pseudo-TTY (so it enters interactive mode under launchd)

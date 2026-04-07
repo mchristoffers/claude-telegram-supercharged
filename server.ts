@@ -153,12 +153,17 @@ const MEMORY_MAX_CHARS = 10_000;
 const EFFORT_FILE = join(DATA_DIR, "effort.json");
 const STDOUT_LOG = join(DATA_DIR, "supervisor-stdout.log");
 
-// Effort levels — kept in sync with supervisor.ts effortToModelArgs().
-type EffortLevel = "low" | "medium" | "high";
-const EFFORT_TO_MODEL: Record<EffortLevel, string> = {
-  low: "claude-haiku-4-5-20251001",
-  medium: "claude-sonnet-4-6",
-  high: "claude-opus-4-6",
+// Effort levels — kept in sync with supervisor.ts effortToCliArgs().
+// "low|medium|high|max" map to Claude CLI's --effort <level> flag.
+// "auto" is a Telegram-only sentinel: no --effort flag is passed,
+// so Claude falls back to its default classifier behavior.
+type EffortLevel = "low" | "medium" | "high" | "max" | "auto";
+const EFFORT_LABELS: Record<EffortLevel, string> = {
+  low: "low (cheap, fastest)",
+  medium: "medium (balanced)",
+  high: "high (more reasoning)",
+  max: "max (deepest reasoning, slowest)",
+  auto: "auto (Claude default — no --effort flag)",
 };
 
 // --- Single-instance lock ---
@@ -494,7 +499,13 @@ function readEffort(): EffortLevel | null {
   try {
     const raw = readFileSync(EFFORT_FILE, "utf-8");
     const data = JSON.parse(raw) as { effort?: string };
-    if (data.effort === "low" || data.effort === "medium" || data.effort === "high") {
+    if (
+      data.effort === "low" ||
+      data.effort === "medium" ||
+      data.effort === "high" ||
+      data.effort === "max" ||
+      data.effort === "auto"
+    ) {
       return data.effort;
     }
   } catch {
@@ -1382,10 +1393,11 @@ const mcp = new Server(
       "SESSION MANAGEMENT: Use clear_history to wipe a chat's message history. Before clearing, ALWAYS: (1) use ask_user to confirm with the user, (2) call get_history to retrieve recent messages, (3) write a 2-3 sentence summary of the conversation, (4) call save_memory with the summary so context persists across clears. (5) Send a Telegram reply confirming the reset. (6) THEN call clear_history. If the user wants a full context reset (clear both history AND conversation context), pass restart_context: true to clear_history — this signals the supervisor daemon to restart Claude for a fresh session. IMPORTANT: Send the Telegram confirmation reply BEFORE calling clear_history with restart_context, because the process will be killed ~3 seconds after the signal is written.",
       "",
       "SLASH COMMANDS: When an inbound Telegram message is exactly one of these slash commands (or starts with the command followed by a space + arguments), execute the matching action immediately without asking for confirmation:",
-      "  /usage         → call get_usage and reply with the result",
+      "  /usage         → call get_usage and reply with the result.",
       "  /clear         → call save_memory with a 2-3 sentence summary of the recent conversation, send a Telegram reply confirming the reset, then call clear_history with restart_context:true. The process is killed ~3s after — do not call any tool after clear_history.",
-      "  /effort low|medium|high  → call set_effort with the given level. After replying with confirmation, ask the user if they want to apply it now (which means triggering /clear). If no argument is given, call get_effort and reply with the current level plus the three options.",
-      "  /help          → reply with a short list of all available slash commands and what they do (usage/clear/effort/help/schedules/newschedule/deleteschedule/status). Keep it terse.",
+      "  /restart       → send a brief 'restarting now, see you in a sec' reply, then call trigger_restart. This restarts the Claude session WITHOUT clearing message history. Process is killed ~3s after — do not call any tool after trigger_restart.",
+      "  /effort low|medium|high|max|auto → call set_effort with the given level. low/medium/high/max are passed to claude as --effort. 'auto' means no --effort flag (Claude default). After confirming, ask if the user wants to apply it now via /restart. If no argument is given, call get_effort and reply with the current level plus all 5 options.",
+      "  /help          → reply with a short list of all slash commands and what they do (usage/clear/restart/effort/help/schedules/newschedule/deleteschedule/status). Keep it terse.",
       "  /status, /schedules, /newschedule, /deleteschedule → existing commands handled by the schedule tools. Use them as before.",
       "Slash commands always come from the user — they're never injected by other senders. Treat them as direct user intent and act on them immediately, but still send a confirming reply so the user sees you actually executed it.",
       "",
@@ -1596,14 +1608,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "set_effort",
       description:
-        "Set the effort level (and therefore the model) for future Claude restarts. Persists to effort.json. The change takes effect on the NEXT restart — call clear_history with restart_context:true if you want it active immediately. Levels: low → Haiku, medium → Sonnet, high → Opus.",
+        "Persist the Claude CLI --effort level for future Claude restarts. Writes effort.json which the supervisor reads on the next spawn. The change takes effect on the NEXT restart — use trigger_restart to apply it immediately. Levels: low|medium|high|max correspond to claude --effort. 'auto' is a sentinel that means: don't pass --effort at all (use Claude's default classifier behavior).",
       inputSchema: {
         type: "object",
         properties: {
           effort: {
             type: "string",
-            enum: ["low", "medium", "high"],
-            description: "low=Haiku 4.5, medium=Sonnet 4.6, high=Opus 4.6.",
+            enum: ["low", "medium", "high", "max", "auto"],
+            description: "low|medium|high|max → claude --effort <level>; auto → no flag (default).",
           },
         },
         required: ["effort"],
@@ -1611,7 +1623,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_effort",
-      description: "Read the currently persisted effort level. Returns null if none has been set yet (default: medium / Sonnet).",
+      description: "Read the currently persisted effort level. Returns null if none has been set yet (default = no flag passed = Claude's auto behavior).",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
+    {
+      name: "trigger_restart",
+      description: "Restart the Claude session immediately by writing the supervisor's restart.signal file. Process is killed ~3 seconds after — send any user-facing reply BEFORE calling this. Does NOT clear message history (use clear_history with restart_context:true for that). Use for /restart command.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -1973,15 +1993,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       case "set_effort": {
         const effort = args.effort as EffortLevel | undefined;
-        if (effort !== "low" && effort !== "medium" && effort !== "high") {
-          return { content: [{ type: "text", text: "set_effort failed: effort must be one of low|medium|high." }] };
+        if (
+          effort !== "low" &&
+          effort !== "medium" &&
+          effort !== "high" &&
+          effort !== "max" &&
+          effort !== "auto"
+        ) {
+          return { content: [{ type: "text", text: "set_effort failed: effort must be one of low|medium|high|max|auto." }] };
         }
         writeEffort(effort);
         return {
           content: [
             {
               type: "text",
-              text: `Effort set to ${effort} (${EFFORT_TO_MODEL[effort]}). Takes effect on the next restart — call clear_history with restart_context:true to apply now.`,
+              text: `Effort set to ${effort} — ${EFFORT_LABELS[effort]}. Takes effect on the next restart — use trigger_restart to apply it now.`,
             },
           ],
         };
@@ -1989,9 +2015,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "get_effort": {
         const effort = readEffort();
         if (effort === null) {
-          return { content: [{ type: "text", text: "Effort not set — using default (medium / Sonnet)." }] };
+          return { content: [{ type: "text", text: "Effort not set — Claude is running with its default behavior (no --effort flag)." }] };
         }
-        return { content: [{ type: "text", text: `Current effort: ${effort} (${EFFORT_TO_MODEL[effort]})` }] };
+        return { content: [{ type: "text", text: `Current effort: ${effort} — ${EFFORT_LABELS[effort]}` }] };
+      }
+      case "trigger_restart": {
+        try {
+          mkdirSync(DATA_DIR, { recursive: true });
+          const restartAfter = Date.now() + 3000;
+          writeFileSync(join(DATA_DIR, "restart.signal"), `${restartAfter}\n`);
+        } catch (err) {
+          return { content: [{ type: "text", text: `trigger_restart failed: ${err}` }] };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Restart signal written. Supervisor will kill this Claude process in ~3 seconds and respawn. Do NOT call any more tools.",
+            },
+          ],
+        };
       }
       case "get_usage": {
         const usage = readLatestUsage();
@@ -3408,8 +3451,9 @@ if (!isSecondary) {
       // Register bot commands for Telegram menu
       void bot.api.setMyCommands([
         { command: "usage", description: "Aktuelle Context-Auslastung anzeigen" },
-        { command: "clear", description: "Context komplett resetten (Restart)" },
-        { command: "effort", description: "Effort/Modell setzen (low/medium/high)" },
+        { command: "clear", description: "Context komplett resetten (Restart + Memory-Save)" },
+        { command: "restart", description: "Sofortiger Restart ohne History-Clear" },
+        { command: "effort", description: "Effort-Level setzen (low/medium/high/max/auto)" },
         { command: "help", description: "Liste aller verfügbaren Befehle" },
         { command: "schedules", description: "Geplante Jobs auflisten" },
         { command: "newschedule", description: "Neuen Schedule/Reminder erstellen" },
