@@ -147,9 +147,6 @@ const DATA_DIR = join(STATE_DIR, "data");
 const DB_PATH = join(DATA_DIR, "messages.db");
 const MEMORY_FILE = join(DATA_DIR, "memory.md");
 const MEMORY_MAX_CHARS = 10_000;
-const SESSION_FILE = join(DATA_DIR, "SESSION.md");
-const SESSION_MAX_CHARS = 4_000;
-const SAVE_SESSION_SIGNAL = join(DATA_DIR, "save-session.signal");
 
 // --- Single-instance lock ---
 const LOCK_FILE = join(DATA_DIR, "telegram.lock");
@@ -475,27 +472,6 @@ function appendMemory(entry: string): void {
   writeFileSync(MEMORY_FILE, `${existing.trim()}\n`);
 }
 
-// ── Session context (OpenClaw-inspired epochs) ──────────────────────
-// SESSION.md is a persistent context file with decreasing granularity.
-// Updated at session end (watchdog restart, context threshold, explicit).
-
-function readSession(): string {
-  try {
-    return readFileSync(SESSION_FILE, "utf-8");
-  } catch {
-    return "";
-  }
-}
-
-function writeSession(content: string): void {
-  mkdirSync(DATA_DIR, { recursive: true });
-  // Cap at SESSION_MAX_CHARS
-  if (content.length > SESSION_MAX_CHARS) {
-    content = content.slice(0, SESSION_MAX_CHARS) + "\n\n[...truncated to fit limit]";
-  }
-  writeFileSync(SESSION_FILE, content);
-}
-
 // ── Scheduled messages (OpenClaw-inspired) ─────────────────────────
 // Three schedule types: "at" (one-shot ISO timestamp), "every" (interval ms),
 // "cron" (cron expression). Persists to disk, survives restarts.
@@ -636,39 +612,9 @@ function checkSchedules(): void {
   }
 }
 
-/** Check if supervisor requested a session save. Sends a direct MCP channel notification to Claude. */
-function checkSaveSessionSignal(): void {
-  try {
-    if (!existsSync(SAVE_SESSION_SIGNAL)) return;
-    const chatId = readFileSync(SAVE_SESSION_SIGNAL, "utf-8").trim() || "system";
-
-    // Send directly as MCP channel notification — Claude sees this immediately
-    void mcp.notification({
-      method: "notifications/claude/channel",
-      params: {
-        content: "SESSION_SAVE_REQUESTED: Session restart is imminent. Call save_session NOW with an updated SESSION.md. Read the current SESSION.md first (if it exists), merge your session knowledge, compress older epochs, and write the result. You have ~10 seconds before the process is killed.",
-        meta: {
-          chat_id: chatId,
-          user: "supervisor",
-          user_id: "system",
-          ts: new Date().toISOString(),
-          event_type: "session_save",
-        },
-      },
-    });
-
-    // Remove signal — supervisor will wait then proceed with kill
-    rmSync(SAVE_SESSION_SIGNAL, { force: true });
-    process.stderr.write(`telegram channel: session save signal consumed, notification sent\n`);
-  } catch (err) {
-    process.stderr.write(`telegram channel: checkSaveSessionSignal error: ${err}\n`);
-  }
-}
-
-// Start the schedule checker loop (every 30 seconds) + session save signal check
+// Start the schedule checker loop (every 30 seconds)
 setInterval(() => {
   checkSchedules();
-  checkSaveSessionSignal();
 }, 30_000);
 
 // ── Message history store (bun:sqlite) ──────────────────────────────
@@ -1377,13 +1323,6 @@ const mcp = new Server(
       "",
       "URL HANDLING — YOUTUBE: When a message contains a YouTube URL (youtube.com/watch, youtu.be/, youtube.com/shorts/), check if mcp__apify-actors__invideoiq-slash-video-transcript-scraper is available. If so, use it to transcribe the video. Pass video_url with the URL. Present the video title, duration, and a summary of the transcript. If the tool is not available, fall back to WebFetch.",
       "",
-      ...(readSession() ? [
-        "SESSION CONTEXT (persistent across restarts, decreasing detail by age):",
-        readSession(),
-        "",
-      ] : []),
-      "SESSION.md: You have a persistent SESSION.md file that survives restarts. It captures your ENTIRE session context — not just Telegram messages, but everything: tasks you worked on, tool results, research findings, decisions made, code changes, errors encountered, open issues. When the supervisor signals a session save (you'll receive a 'SESSION_SAVE_REQUESTED' message), call save_session IMMEDIATELY with an updated SESSION.md. Structure with epoch-based granularity: ## Recent (detailed: current/last session — what you did, what happened, what's pending) → ## Today (compact summaries per topic/task) → ## This Week (one-liner per day) → ## Earlier (one-liner per week). Keep total under 4000 chars. Read the existing SESSION.md first, merge your current session knowledge in, and compress older epochs to make room for new content.",
-      "",
       ...(readMemory() ? ["CONVERSATION MEMORY (summaries from previous sessions):", readMemory()] : []),
     ].join("\n"),
   },
@@ -1571,21 +1510,6 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ["chat_id", "summary"],
-      },
-    },
-    {
-      name: "save_session",
-      description:
-        "Write the SESSION.md file with epoch-based context. Call this when you receive a SESSION_SAVE_REQUESTED notification, or when explicitly asked. The content should follow the epoch structure: ## Recent (detailed current session), ## Today (summaries), ## This Week (one-liners), ## Earlier (compressed). Merge your current knowledge with the existing SESSION.md content. Max ~4000 chars.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          content: {
-            type: "string",
-            description: "Full SESSION.md content with epoch-based structure.",
-          },
-        },
-        required: ["content"],
       },
     },
     {
@@ -1933,16 +1857,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         appendMemory(`**Chat ${chat_id}**: ${summary}`);
         return { content: [{ type: "text", text: "Memory saved. Summary will be loaded on next startup." }] };
-      }
-      case "save_session": {
-        const content = args.content as string;
-        if (!content || content.length < 10) {
-          return { content: [{ type: "text", text: "save_session failed: content must be at least 10 characters." }] };
-        }
-        writeSession(content);
-        // Clear the save-session signal if it exists
-        try { rmSync(SAVE_SESSION_SIGNAL, { force: true }); } catch {}
-        return { content: [{ type: "text", text: `SESSION.md updated (${content.length} chars). Will be loaded on next startup.` }] };
       }
       case "schedule": {
         const action = args.action as string;

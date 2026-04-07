@@ -33,8 +33,6 @@ import { join } from "node:path";
 const STATE_DIR = join(homedir(), ".claude", "channels", "telegram");
 const DATA_DIR = join(STATE_DIR, "data");
 const SIGNAL_FILE = join(DATA_DIR, "restart.signal");
-const SAVE_SESSION_SIGNAL = join(DATA_DIR, "save-session.signal");
-const SESSION_SAVE_WAIT_MS = 15_000; // Wait 15s for Claude to save SESSION.md
 const CLAUDE_CMD = "claude";
 const BASE_ARGS = [
 	"--channels",
@@ -320,24 +318,12 @@ async function cleanupOrphans(): Promise<void> {
 	}
 }
 
-// ── Session save before restart ─���────────────────────────────────
-// Writes a save-session signal, waits for Claude to save SESSION.md,
-// then triggers the actual restart.
+// ── Restart trigger ───────────────────────────────────────────────
+// Schedules a graceful restart by writing the restart.signal file.
+// server.ts watches the signal and triggers the supervisor to kill+respawn.
 
-async function triggerSessionSaveThenRestart(reason: string): Promise<void> {
-	log(`requesting session save before restart (reason: ${reason})`);
-	mkdirSync(DATA_DIR, { recursive: true });
-
-	// Write the save-session signal — server.ts will pick this up and notify Claude
-	// Include the main chat_id so the server knows where to send the notification
-	writeFileSync(SAVE_SESSION_SIGNAL, "950478766");
-
-	// Wait for Claude to save SESSION.md
-	log(`waiting ${SESSION_SAVE_WAIT_MS / 1000}s for Claude to save SESSION.md...`);
-	await new Promise((r) => setTimeout(r, SESSION_SAVE_WAIT_MS));
-
-	// Now trigger the actual restart
-	log("session save wait complete — triggering restart");
+function triggerRestart(reason: string): void {
+	log(`triggering restart (reason: ${reason})`);
 	mkdirSync(join(SIGNAL_FILE, ".."), { recursive: true });
 	writeFileSync(SIGNAL_FILE, String(Date.now() + 2000));
 }
@@ -376,18 +362,18 @@ function startContextWatchdog(): void {
 
 			// Check 1: context too high
 			if (lastPct >= CONTEXT_THRESHOLD_PCT && lastPct <= 100) {
-				log(`context watchdog: usage at ${lastPct}% (threshold: ${CONTEXT_THRESHOLD_PCT}%) — triggering session save + restart`);
+				log(`context watchdog: usage at ${lastPct}% (threshold: ${CONTEXT_THRESHOLD_PCT}%) — triggering restart`);
 				lastWatchdogTrigger = Date.now();
-				void triggerSessionSaveThenRestart("context");
+				triggerRestart("context");
 				return;
 			}
 
 			// Check 2: session running too long (prevents dormancy bug)
 			const uptime = Date.now() - lastStartTime;
 			if (uptime > MAX_SESSION_UPTIME_MS) {
-				log(`context watchdog: session uptime ${Math.round(uptime / 60000)}min exceeds max ${Math.round(MAX_SESSION_UPTIME_MS / 60000)}min — triggering session save + restart`);
+				log(`context watchdog: session uptime ${Math.round(uptime / 60000)}min exceeds max ${Math.round(MAX_SESSION_UPTIME_MS / 60000)}min — triggering restart`);
 				lastWatchdogTrigger = Date.now();
-				void triggerSessionSaveThenRestart("uptime");
+				triggerRestart("uptime");
 				return;
 			}
 		} catch {
