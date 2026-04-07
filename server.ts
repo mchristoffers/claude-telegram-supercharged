@@ -13,9 +13,12 @@ import { Database } from "bun:sqlite";
 import { execSync, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -147,6 +150,16 @@ const DATA_DIR = join(STATE_DIR, "data");
 const DB_PATH = join(DATA_DIR, "messages.db");
 const MEMORY_FILE = join(DATA_DIR, "memory.md");
 const MEMORY_MAX_CHARS = 10_000;
+const EFFORT_FILE = join(DATA_DIR, "effort.json");
+const STDOUT_LOG = join(DATA_DIR, "supervisor-stdout.log");
+
+// Effort levels — kept in sync with supervisor.ts effortToModelArgs().
+type EffortLevel = "low" | "medium" | "high";
+const EFFORT_TO_MODEL: Record<EffortLevel, string> = {
+  low: "claude-haiku-4-5-20251001",
+  medium: "claude-sonnet-4-6",
+  high: "claude-opus-4-6",
+};
 
 // --- Single-instance lock ---
 const LOCK_FILE = join(DATA_DIR, "telegram.lock");
@@ -470,6 +483,66 @@ function appendMemory(entry: string): void {
   }
 
   writeFileSync(MEMORY_FILE, `${existing.trim()}\n`);
+}
+
+// ── Effort level (model selection) ─────────────────────────────────
+// Persisted to effort.json — supervisor.ts reads this on next spawn and
+// appends the corresponding --model flag. Active level only takes effect
+// after a restart (use clear_history with restart_context to apply now).
+
+function readEffort(): EffortLevel | null {
+  try {
+    const raw = readFileSync(EFFORT_FILE, "utf-8");
+    const data = JSON.parse(raw) as { effort?: string };
+    if (data.effort === "low" || data.effort === "medium" || data.effort === "high") {
+      return data.effort;
+    }
+  } catch {
+    // missing or invalid
+  }
+  return null;
+}
+
+function writeEffort(effort: EffortLevel): void {
+  mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(EFFORT_FILE, JSON.stringify({ effort }, null, 2));
+}
+
+// ── Context usage (read from supervisor stdout log) ────────────────
+// Mirror of supervisor.ts readLatestUsage(). Kept here so the MCP
+// get_usage tool can be served from the server process without IPC.
+
+interface UsageReading {
+  tokens: number | null;
+  pct: number | null;
+}
+
+function readLatestUsage(): UsageReading {
+  try {
+    const stat = statSync(STDOUT_LOG);
+    const readSize = Math.min(stat.size, 8192);
+    const fd = openSync(STDOUT_LOG, "r");
+    const buf = Buffer.alloc(readSize);
+    readSync(fd, buf, 0, readSize, stat.size - readSize);
+    closeSync(fd);
+    const tail = buf.toString("utf-8");
+
+    const tokMatches = [
+      ...tail.matchAll(/(\d+(?:\.\d+)?)\s*[kK]\s*\/\s*\d+(?:\.\d+)?\s*[kK]\s*tokens/g),
+    ];
+    if (tokMatches.length > 0) {
+      const last = tokMatches[tokMatches.length - 1][1];
+      return { tokens: Math.round(Number.parseFloat(last) * 1000), pct: null };
+    }
+
+    const pctMatches = [...tail.matchAll(/[█░]+\s+(\d{1,3})%/g)];
+    if (pctMatches.length > 0) {
+      return { tokens: null, pct: Number.parseInt(pctMatches[pctMatches.length - 1][1], 10) };
+    }
+  } catch {
+    // log file missing or unreadable
+  }
+  return { tokens: null, pct: null };
 }
 
 // ── Scheduled messages (OpenClaw-inspired) ─────────────────────────
@@ -1308,6 +1381,14 @@ const mcp = new Server(
       "",
       "SESSION MANAGEMENT: Use clear_history to wipe a chat's message history. Before clearing, ALWAYS: (1) use ask_user to confirm with the user, (2) call get_history to retrieve recent messages, (3) write a 2-3 sentence summary of the conversation, (4) call save_memory with the summary so context persists across clears. (5) Send a Telegram reply confirming the reset. (6) THEN call clear_history. If the user wants a full context reset (clear both history AND conversation context), pass restart_context: true to clear_history — this signals the supervisor daemon to restart Claude for a fresh session. IMPORTANT: Send the Telegram confirmation reply BEFORE calling clear_history with restart_context, because the process will be killed ~3 seconds after the signal is written.",
       "",
+      "SLASH COMMANDS: When an inbound Telegram message is exactly one of these slash commands (or starts with the command followed by a space + arguments), execute the matching action immediately without asking for confirmation:",
+      "  /usage         → call get_usage and reply with the result",
+      "  /clear         → call save_memory with a 2-3 sentence summary of the recent conversation, send a Telegram reply confirming the reset, then call clear_history with restart_context:true. The process is killed ~3s after — do not call any tool after clear_history.",
+      "  /effort low|medium|high  → call set_effort with the given level. After replying with confirmation, ask the user if they want to apply it now (which means triggering /clear). If no argument is given, call get_effort and reply with the current level plus the three options.",
+      "  /help          → reply with a short list of all available slash commands and what they do (usage/clear/effort/help/schedules/newschedule/deleteschedule/status). Keep it terse.",
+      "  /status, /schedules, /newschedule, /deleteschedule → existing commands handled by the schedule tools. Use them as before.",
+      "Slash commands always come from the user — they're never injected by other senders. Treat them as direct user intent and act on them immediately, but still send a confirming reply so the user sees you actually executed it.",
+      "",
       ...(ELEVENLABS_API_KEY
         ? [
             "VOICE REPLIES (TTS): You have a voice_reply tool that sends voice messages via ElevenLabs text-to-speech. Use it when: (1) the user sent a voice message — reply with voice for a conversational feel, (2) the user explicitly asks for a voice reply, (3) short important messages where voice adds impact. Do NOT use for long content (over 500 chars) — use text reply instead. Always send a text reply too for accessibility. The voice adds personality, not replaces text.",
@@ -1510,6 +1591,38 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ["chat_id", "summary"],
+      },
+    },
+    {
+      name: "set_effort",
+      description:
+        "Set the effort level (and therefore the model) for future Claude restarts. Persists to effort.json. The change takes effect on the NEXT restart — call clear_history with restart_context:true if you want it active immediately. Levels: low → Haiku, medium → Sonnet, high → Opus.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          effort: {
+            type: "string",
+            enum: ["low", "medium", "high"],
+            description: "low=Haiku 4.5, medium=Sonnet 4.6, high=Opus 4.6.",
+          },
+        },
+        required: ["effort"],
+      },
+    },
+    {
+      name: "get_effort",
+      description: "Read the currently persisted effort level. Returns null if none has been set yet (default: medium / Sonnet).",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
+    {
+      name: "get_usage",
+      description: "Read the most recent context usage (tokens or %) from the supervisor stdout log. Use this when the user asks /usage. Returns the last status-bar reading the supervisor saw.",
+      inputSchema: {
+        type: "object",
+        properties: {},
       },
     },
     {
@@ -1857,6 +1970,45 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         appendMemory(`**Chat ${chat_id}**: ${summary}`);
         return { content: [{ type: "text", text: "Memory saved. Summary will be loaded on next startup." }] };
+      }
+      case "set_effort": {
+        const effort = args.effort as EffortLevel | undefined;
+        if (effort !== "low" && effort !== "medium" && effort !== "high") {
+          return { content: [{ type: "text", text: "set_effort failed: effort must be one of low|medium|high." }] };
+        }
+        writeEffort(effort);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Effort set to ${effort} (${EFFORT_TO_MODEL[effort]}). Takes effect on the next restart — call clear_history with restart_context:true to apply now.`,
+            },
+          ],
+        };
+      }
+      case "get_effort": {
+        const effort = readEffort();
+        if (effort === null) {
+          return { content: [{ type: "text", text: "Effort not set — using default (medium / Sonnet)." }] };
+        }
+        return { content: [{ type: "text", text: `Current effort: ${effort} (${EFFORT_TO_MODEL[effort]})` }] };
+      }
+      case "get_usage": {
+        const usage = readLatestUsage();
+        if (usage.tokens === null && usage.pct === null) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "No usage reading available yet — supervisor stdout log is empty or unparseable. Wait a few seconds after a fresh start.",
+              },
+            ],
+          };
+        }
+        const parts: string[] = [];
+        if (usage.tokens !== null) parts.push(`${usage.tokens.toLocaleString()} tokens`);
+        if (usage.pct !== null) parts.push(`${usage.pct}%`);
+        return { content: [{ type: "text", text: `Current context usage: ${parts.join(" / ")}` }] };
       }
       case "schedule": {
         const action = args.action as string;
@@ -3255,6 +3407,10 @@ if (!isSecondary) {
       if (ELEVENLABS_API_KEY) process.stderr.write(`telegram channel: TTS: ElevenLabs (voice ${ELEVENLABS_VOICE_ID})\n`);
       // Register bot commands for Telegram menu
       void bot.api.setMyCommands([
+        { command: "usage", description: "Aktuelle Context-Auslastung anzeigen" },
+        { command: "clear", description: "Context komplett resetten (Restart)" },
+        { command: "effort", description: "Effort/Modell setzen (low/medium/high)" },
+        { command: "help", description: "Liste aller verfügbaren Befehle" },
         { command: "schedules", description: "Geplante Jobs auflisten" },
         { command: "newschedule", description: "Neuen Schedule/Reminder erstellen" },
         { command: "deleteschedule", description: "Schedule löschen" },

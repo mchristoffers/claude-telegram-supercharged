@@ -16,6 +16,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import {
 	closeSync,
+	createWriteStream,
 	existsSync,
 	mkdirSync,
 	openSync,
@@ -23,10 +24,12 @@ import {
 	readSync,
 	rmSync,
 	statSync,
+	truncateSync,
 	unwatchFile,
 	watchFile,
 	writeFileSync,
 } from "node:fs";
+import type { WriteStream } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -48,11 +51,20 @@ const BACKOFF_MAX_MS = 30_000;
 const STABLE_UPTIME_MS = 60_000;
 const GRACEFUL_TIMEOUT_MS = 5_000;
 const CONTEXT_CHECK_INTERVAL_MS = 30_000; // Check context every 30s
-const CONTEXT_THRESHOLD_PCT = 50; // Auto-restart when context exceeds 50% — keeps sessions fresh
 const MAX_SESSION_UPTIME_MS = 2 * 60 * 60 * 1000; // Force restart after 2 hours regardless of context
 const STDOUT_LOG = join(DATA_DIR, "supervisor-stdout.log");
+const STDOUT_LOG_MAX_BYTES = 1_000_000; // Truncate log on each spawn if larger
+const EFFORT_FILE = join(DATA_DIR, "effort.json");
 // Delay before restart to let Claude finish sending Telegram replies
 const RESTART_DELAY_MS = 3_000;
+
+// Token thresholds — primary signal for the context watchdog.
+const CONTEXT_THRESHOLD_TOKENS = 100_000;
+// Fallback when only a percentage status bar is visible.
+const CONTEXT_DEFAULT_MAX_TOKENS = 200_000;
+const CONTEXT_THRESHOLD_PCT_FALLBACK = Math.round(
+	(CONTEXT_THRESHOLD_TOKENS / CONTEXT_DEFAULT_MAX_TOKENS) * 100,
+);
 
 let currentChild: ChildProcess | null = null;
 let restartCount = 0;
@@ -108,6 +120,41 @@ async function killChild(child: ChildProcess): Promise<void> {
 	});
 }
 
+// ── Persisted effort level (model selection) ──────────────────────
+// Read from EFFORT_FILE to decide which --model flag to append on spawn.
+// low → haiku, medium → sonnet (default), high → opus.
+function effortToModelArgs(): string[] {
+	try {
+		const raw = readFileSync(EFFORT_FILE, "utf-8");
+		const data = JSON.parse(raw) as { effort?: string };
+		switch (data.effort) {
+			case "low":
+				return ["--model", "claude-haiku-4-5-20251001"];
+			case "medium":
+				return ["--model", "claude-sonnet-4-6"];
+			case "high":
+				return ["--model", "claude-opus-4-6"];
+		}
+	} catch {
+		// File missing or invalid — fall through to default
+	}
+	return [];
+}
+
+let currentLogStream: WriteStream | null = null;
+function openLogStream(): WriteStream {
+	mkdirSync(DATA_DIR, { recursive: true });
+	// Truncate the log if it grew too big — keeps disk usage bounded.
+	try {
+		const stat = statSync(STDOUT_LOG);
+		if (stat.size > STDOUT_LOG_MAX_BYTES) {
+			truncateSync(STDOUT_LOG, 0);
+			log(`truncated supervisor-stdout.log (was ${stat.size} bytes)`);
+		}
+	} catch {}
+	return createWriteStream(STDOUT_LOG, { flags: "a" });
+}
+
 async function startClaude(): Promise<void> {
 	if (shuttingDown) return;
 
@@ -127,14 +174,19 @@ async function startClaude(): Promise<void> {
 	} catch {}
 
 	lastStartTime = Date.now();
-	const args = [...BASE_ARGS, ...EXTRA_ARGS];
+	const modelArgs = effortToModelArgs();
+	const args = [...BASE_ARGS, ...modelArgs, ...EXTRA_ARGS];
 	log(`spawning: ${CLAUDE_CMD} ${args.join(" ")}`);
 	// Use `expect` wrapper to allocate a PTY and auto-accept the workspace trust dialog.
 	// expect spawns Claude with a pseudo-TTY (so it enters interactive mode under launchd)
 	// and auto-sends Enter when it sees the "trust this folder" prompt.
 	const EXPECT_WRAPPER = join(homedir(), ".claude", "scripts", "claude-daemon-wrapper.exp");
+	// stdio = ["inherit", "pipe", "pipe"]: stdin stays interactive (so the
+	// expect wrapper can receive input), but stdout/stderr are captured so
+	// the context watchdog actually has something to read in STDOUT_LOG.
+	currentLogStream = openLogStream();
 	const child = spawn(EXPECT_WRAPPER, args, {
-		stdio: "inherit",
+		stdio: ["inherit", "pipe", "pipe"],
 		env: { ...process.env },
 		detached: true, // Create a new process group so we can kill the entire tree
 	});
@@ -142,8 +194,19 @@ async function startClaude(): Promise<void> {
 	// unref() is NOT called — the supervisor event loop keeps running.
 	currentChild = child;
 
+	// Tee stdout/stderr to BOTH the parent terminal (tmux visibility) and
+	// the rotating log file (watchdog source of truth + /usage tool).
+	const tee = (chunk: Buffer | string, dest: NodeJS.WritableStream): void => {
+		dest.write(chunk);
+		currentLogStream?.write(chunk);
+	};
+	child.stdout?.on("data", (chunk) => tee(chunk, process.stdout));
+	child.stderr?.on("data", (chunk) => tee(chunk, process.stderr));
+
 	child.on("exit", (code, signal) => {
 		currentChild = null;
+		try { currentLogStream?.end(); } catch {}
+		currentLogStream = null;
 		if (shuttingDown) return;
 
 		if (pendingRestart) {
@@ -329,9 +392,49 @@ function triggerRestart(reason: string): void {
 }
 
 // ── Context watchdog ──────────────────────────────────────────────
-// Monitors the stdout log for context usage percentage.
-// When it exceeds CONTEXT_THRESHOLD_PCT, triggers a graceful restart
+// Monitors the stdout log for context usage and triggers a graceful
+// restart when it exceeds CONTEXT_THRESHOLD_TOKENS (or the pct fallback)
 // to prevent the session from becoming unresponsive.
+
+export interface UsageReading {
+	tokens: number | null;
+	pct: number | null;
+}
+
+/** Read the most recent usage signal from STDOUT_LOG. Returns nulls if nothing found. */
+export function readLatestUsage(): UsageReading {
+	try {
+		const stat = statSync(STDOUT_LOG);
+		// Read last 8KB — enough for several status bar lines
+		const readSize = Math.min(stat.size, 8192);
+		const fd = openSync(STDOUT_LOG, "r");
+		const buf = Buffer.alloc(readSize);
+		readSync(fd, buf, 0, readSize, stat.size - readSize);
+		closeSync(fd);
+		const tail = buf.toString("utf-8");
+
+		// Prefer explicit token count if Claude logs one (e.g. "150k/200k tokens")
+		const tokMatches = [
+			...tail.matchAll(/(\d+(?:\.\d+)?)\s*[kK]\s*\/\s*\d+(?:\.\d+)?\s*[kK]\s*tokens/g),
+		];
+		if (tokMatches.length > 0) {
+			const last = tokMatches[tokMatches.length - 1][1];
+			const tokens = Math.round(Number.parseFloat(last) * 1000);
+			return { tokens, pct: null };
+		}
+
+		// Fallback: status bar pattern ░█ followed by percentage.
+		// Negative lookahead avoids matching "85% sure" inside message content.
+		const pctMatches = [...tail.matchAll(/[█░]+\s+(\d{1,3})%/g)];
+		if (pctMatches.length > 0) {
+			const pct = Number.parseInt(pctMatches[pctMatches.length - 1][1], 10);
+			return { tokens: null, pct };
+		}
+	} catch {
+		// Log file may not exist yet
+	}
+	return { tokens: null, pct: null };
+}
 
 let contextWatchdogTimer: ReturnType<typeof setInterval> | null = null;
 let lastWatchdogTrigger = 0;
@@ -342,42 +445,32 @@ function startContextWatchdog(): void {
 		if (!currentChild || shuttingDown) return;
 		// Debounce: don't trigger more than once per 60 seconds
 		if (Date.now() - lastWatchdogTrigger < 60_000) return;
-		try {
-			// Read the last 2KB of the stdout log to find the context percentage
-			const stat = statSync(STDOUT_LOG);
-			const readSize = Math.min(stat.size, 2048);
-			const fd = openSync(STDOUT_LOG, "r");
-			const buf = Buffer.alloc(readSize);
-			readSync(fd, buf, 0, readSize, stat.size - readSize);
-			closeSync(fd);
-			const tail = buf.toString("utf-8");
 
-			// Match the status bar pattern: ░█ blocks followed by percentage
-			// This avoids false positives from message content like "I'm 85% sure"
-			const matches = [...tail.matchAll(/[█░]+\s+(\d{1,3})%/g)];
-			if (matches.length === 0) return;
+		const usage = readLatestUsage();
 
-			// Take the last percentage found (most recent status bar)
-			const lastPct = Number.parseInt(matches[matches.length - 1][1], 10);
+		// Check 1a: explicit token count exceeds threshold
+		if (usage.tokens !== null && usage.tokens >= CONTEXT_THRESHOLD_TOKENS) {
+			log(`context watchdog: usage at ${usage.tokens} tokens (threshold: ${CONTEXT_THRESHOLD_TOKENS}) — triggering restart`);
+			lastWatchdogTrigger = Date.now();
+			triggerRestart("context-tokens");
+			return;
+		}
 
-			// Check 1: context too high
-			if (lastPct >= CONTEXT_THRESHOLD_PCT && lastPct <= 100) {
-				log(`context watchdog: usage at ${lastPct}% (threshold: ${CONTEXT_THRESHOLD_PCT}%) — triggering restart`);
-				lastWatchdogTrigger = Date.now();
-				triggerRestart("context");
-				return;
-			}
+		// Check 1b: percentage status bar at/above fallback threshold
+		if (usage.pct !== null && usage.pct >= CONTEXT_THRESHOLD_PCT_FALLBACK && usage.pct <= 100) {
+			log(`context watchdog: usage at ${usage.pct}% (fallback threshold: ${CONTEXT_THRESHOLD_PCT_FALLBACK}%, ~${CONTEXT_THRESHOLD_TOKENS} tokens) — triggering restart`);
+			lastWatchdogTrigger = Date.now();
+			triggerRestart("context-pct");
+			return;
+		}
 
-			// Check 2: session running too long (prevents dormancy bug)
-			const uptime = Date.now() - lastStartTime;
-			if (uptime > MAX_SESSION_UPTIME_MS) {
-				log(`context watchdog: session uptime ${Math.round(uptime / 60000)}min exceeds max ${Math.round(MAX_SESSION_UPTIME_MS / 60000)}min — triggering restart`);
-				lastWatchdogTrigger = Date.now();
-				triggerRestart("uptime");
-				return;
-			}
-		} catch {
-			// Ignore read errors — file might not exist yet
+		// Check 2: session running too long (prevents dormancy bug)
+		const uptime = Date.now() - lastStartTime;
+		if (uptime > MAX_SESSION_UPTIME_MS) {
+			log(`context watchdog: session uptime ${Math.round(uptime / 60000)}min exceeds max ${Math.round(MAX_SESSION_UPTIME_MS / 60000)}min — triggering restart`);
+			lastWatchdogTrigger = Date.now();
+			triggerRestart("uptime");
+			return;
 		}
 	}, CONTEXT_CHECK_INTERVAL_MS);
 }
