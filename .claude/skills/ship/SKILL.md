@@ -39,11 +39,25 @@ Run this after **every** finished code change in `claude-telegram-supercharged`.
    git push origin master
    ```
 
-5. **Restart Kackstein** so the entrypoint re-runs the plugin-cache overlay:
+5. **Force-overwrite the plugin cache from the mounted fork.** Don't trust the entrypoint to pick everything up — explicitly mirror every fork file the daemon reads (server.ts, skills/, supervisor.ts) into the live cache + script paths. This is idempotent and runs on every ship so a forgotten file in the entrypoint can never silently leave stale code running.
+   ```bash
+   docker exec personal-claude-1 bash -c '
+     for TGDIR in $(find /root/.claude/plugins/cache/claude-plugins-official/telegram -mindepth 1 -maxdepth 1 -type d 2>/dev/null) \
+                  /root/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/telegram; do
+       [ -d "$TGDIR" ] || continue
+       cp /opt/telegram-supercharged/server.ts "$TGDIR/server.ts"
+       [ -d /opt/telegram-supercharged/skills ] && cp -r /opt/telegram-supercharged/skills/. "$TGDIR/skills/"
+     done
+     mkdir -p /root/.claude/scripts
+     cp /opt/telegram-supercharged/supervisor.ts /root/.claude/scripts/telegram-supervisor.ts
+   '
+   ```
+
+6. **Restart Kackstein** so the supervisor respawns Claude with the fresh code:
    ```bash
    docker restart personal-claude-1
    ```
-   This re-applies `entrypoint.sh` which copies `/opt/telegram-supercharged/server.ts` and `skills/` into the active plugin cache dir, then the supervisor respawns Claude with fresh code. Takes ~5-10s before the bot is back online.
+   Takes ~5-10s before the bot is back online.
 
 6. **Report** to Moritz in one line: commit hash + what shipped + "kackstein restarted". Don't recap the diff — he just read it.
 

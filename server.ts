@@ -1256,26 +1256,99 @@ interface LiveTail {
 
 let currentLiveTail: LiveTail | null = null;
 
-function getCurrentSessionJsonl(): string | null {
+// Walk up the parent process chain on Linux to find the `claude` host
+// process and read its cwd. The MCP server is spawned a few levels deep
+// (claude → bun run → bun server.ts), so process.cwd() points at the
+// plugin cache dir, not the session's working directory.
+function findClaudeHostCwd(): string | null {
+  try {
+    let pid = process.ppid;
+    for (let i = 0; i < 8 && pid > 1; i++) {
+      let cmdline = "";
+      try {
+        cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf-8").replace(/\0/g, " ").trim();
+      } catch {
+        return null;
+      }
+      // Match the host claude binary, not "bun run …" or wrapper scripts.
+      if (/(^|\/)claude(\s|$)/.test(cmdline) || /^claude\b/.test(cmdline)) {
+        try {
+          return realpathSync(`/proc/${pid}/cwd`);
+        } catch {
+          return null;
+        }
+      }
+      // Read parent PID from /proc/<pid>/status
+      try {
+        const status = readFileSync(`/proc/${pid}/status`, "utf-8");
+        const m = status.match(/^PPid:\s+(\d+)/m);
+        if (!m) return null;
+        pid = Number.parseInt(m[1], 10);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function findMostRecentJsonl(maxAgeMs: number): string | null {
   try {
     const projectsDir = join(homedir(), ".claude", "projects");
-    const encoded = process.cwd().replace(/\//g, "-");
-    const dir = join(projectsDir, encoded);
-    if (!existsSync(dir)) return null;
-    const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
-    if (files.length === 0) return null;
+    if (!existsSync(projectsDir)) return null;
     let newest: { path: string; mtime: number } | null = null;
-    for (const f of files) {
-      const p = join(dir, f);
+    const cutoff = Date.now() - maxAgeMs;
+    for (const sub of readdirSync(projectsDir)) {
+      const dir = join(projectsDir, sub);
+      let entries: string[];
       try {
-        const s = statSync(p);
-        if (!newest || s.mtimeMs > newest.mtime) newest = { path: p, mtime: s.mtimeMs };
-      } catch {}
+        entries = readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const f of entries) {
+        if (!f.endsWith(".jsonl")) continue;
+        const p = join(dir, f);
+        try {
+          const s = statSync(p);
+          if (s.mtimeMs < cutoff) continue;
+          if (!newest || s.mtimeMs > newest.mtime) newest = { path: p, mtime: s.mtimeMs };
+        } catch {}
+      }
     }
     return newest?.path ?? null;
   } catch {
     return null;
   }
+}
+
+function getCurrentSessionJsonl(): string | null {
+  // Preferred: encode the host claude's cwd to find the project dir.
+  const hostCwd = findClaudeHostCwd();
+  if (hostCwd) {
+    const projectsDir = join(homedir(), ".claude", "projects");
+    const encoded = hostCwd.replace(/\//g, "-");
+    const dir = join(projectsDir, encoded);
+    if (existsSync(dir)) {
+      let newest: { path: string; mtime: number } | null = null;
+      try {
+        for (const f of readdirSync(dir)) {
+          if (!f.endsWith(".jsonl")) continue;
+          const p = join(dir, f);
+          try {
+            const s = statSync(p);
+            if (!newest || s.mtimeMs > newest.mtime) newest = { path: p, mtime: s.mtimeMs };
+          } catch {}
+        }
+      } catch {}
+      if (newest) return newest.path;
+    }
+  }
+  // Fallback: pick the most recently written JSONL anywhere — only safe
+  // if it was written in the last 5 minutes (i.e. an active session).
+  return findMostRecentJsonl(5 * 60 * 1000);
 }
 
 function readNewJsonlEntries(path: string, fromOffset: number): { entries: any[]; newOffset: number } {
