@@ -1575,6 +1575,8 @@ const mcp = new Server(
       "",
       "The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool. When a Telegram message asks you to do something (write a post, generate code, answer a question), ALWAYS send the full result back via the reply tool. Never just acknowledge the request — deliver the actual content to Telegram.",
       "",
+      "ACK-FIRST FOR TASKS (HARD RULE): The server programmatically live-edits the most recent reply once per second with the latest 10 events from your session (tool calls, results, snippets), so the user can watch what you're doing in real time. This ONLY works if there IS a recent reply to edit. Therefore: the moment you decide a request is a TASK (anything that triggers Agent, WebFetch/WebSearch, Bash, Read/Write/Edit, MCP tool calls, or more than one tool call total), call reply FIRST with a brief acknowledgment (\"Mach ich, recherchiere...\", \"Ok, schaue nach...\", \"Bin dran, baue das...\") BEFORE any other tool call. Only THEN spawn Agent / start tool work. The live tail will keep that ack message updated with progress automatically — you do not have to send progress updates yourself, just send the final reply when done. SKIP the ack only for: greetings, thanks, instant factual answers from memory, single short replies. When in doubt, ack first.",
+      "",
       ...(IS_HAIKU_ROUTER
         ? [
             "TWO-TIER MODEL ROUTING: You are the fast router (Haiku, 200K context). Respond INSTANTLY to simple messages, hand heavier work to Opus. CRITICAL RULES:",
