@@ -698,16 +698,18 @@ class MessageStore {
     if (this.insertCount % 100 === 0) this.prune();
   }
 
-  /** Get last N messages from a chat, newest first. */
-  getHistory(chatId: string, limit = 50, before?: number): Array<Record<string, unknown>> {
+  /** Get last N messages from a chat, newest first. If threadId is set, restrict to that Forum topic. */
+  getHistory(chatId: string, limit = 50, before?: number, threadId?: number): Array<Record<string, unknown>> {
+    const threadClause = threadId != null ? " AND thread_id = ?" : "";
+    const threadArgs = threadId != null ? [threadId] : [];
     if (before) {
       return this.db
-        .query("SELECT * FROM messages WHERE chat_id = ? AND date < ? ORDER BY date DESC LIMIT ?")
-        .all(chatId, before, limit) as Array<Record<string, unknown>>;
+        .query(`SELECT * FROM messages WHERE chat_id = ? AND date < ?${threadClause} ORDER BY date DESC LIMIT ?`)
+        .all(chatId, before, ...threadArgs, limit) as Array<Record<string, unknown>>;
     }
     return this.db
-      .query("SELECT * FROM messages WHERE chat_id = ? ORDER BY date DESC LIMIT ?")
-      .all(chatId, limit) as Array<Record<string, unknown>>;
+      .query(`SELECT * FROM messages WHERE chat_id = ?${threadClause} ORDER BY date DESC LIMIT ?`)
+      .all(chatId, ...threadArgs, limit) as Array<Record<string, unknown>>;
   }
 
   /** Search messages by text pattern (LIKE %query%). */
@@ -719,9 +721,9 @@ class MessageStore {
       .all(chatId, `%${escaped}%`, limit) as Array<Record<string, unknown>>;
   }
 
-  /** Format last N messages for injection into Claude's context. */
-  formatRecent(chatId: string, count = 5): string {
-    const msgs = this.getHistory(chatId, count);
+  /** Format last N messages for injection into Claude's context. If threadId is set, restrict to that topic. */
+  formatRecent(chatId: string, count = 5, threadId?: number): string {
+    const msgs = this.getHistory(chatId, count, undefined, threadId);
     if (msgs.length === 0) return "";
     // Reverse to chronological order (oldest first)
     msgs.reverse();
@@ -1418,7 +1420,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_history",
       description:
-        "Retrieve recent message history from a Telegram chat. Returns messages stored locally since the bot joined. Use this to get context about earlier conversation without asking the user to repeat themselves.",
+        "Retrieve recent message history from a Telegram chat. Returns messages stored locally since the bot joined. Use this to get context about earlier conversation without asking the user to repeat themselves. Pass thread_id to restrict results to a single Forum topic.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1433,6 +1435,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           before: {
             type: "number",
             description: "Unix timestamp — only return messages before this time. For pagination.",
+          },
+          thread_id: {
+            type: "number",
+            description:
+              "Forum topic thread_id. When set, only messages from that topic are returned. Omit to fetch across all topics.",
           },
         },
         required: ["chat_id"],
@@ -1901,7 +1908,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         assertAllowedChat(chat_id);
         const limit = Math.min(Math.max(1, (args.limit as number | undefined) ?? 50), 200);
         const before = args.before as number | undefined;
-        const msgs = messageStore.getHistory(chat_id, limit, before);
+        const thread_id = args.thread_id as number | undefined;
+        const msgs = messageStore.getHistory(chat_id, limit, before, thread_id);
         if (msgs.length === 0) {
           return { content: [{ type: "text", text: "No messages found in history for this chat." }] };
         }
@@ -3055,8 +3063,10 @@ function flushBatch(chatId: string): void {
   const audioPaths = msgs.filter((m) => m.media?.type === "audio").map((m) => m.media!.path);
   const docPaths = msgs.filter((m) => m.media?.type === "document").map((m) => m.media!.path);
 
-  // Use the last message's context for thread tracking
-  const recentHistory = messageStore.formatRecent(chatId, 5);
+  // Use the last message's context for thread tracking. In Forum topics, scope
+  // recent-history injection to the same topic so conversations don't bleed
+  // between threads.
+  const recentHistory = messageStore.formatRecent(chatId, 5, last.threadId);
   const content = recentHistory ? `${combinedText}\n\n${recentHistory}` : combinedText;
 
   // For group messages, include thread chain from the last message.
