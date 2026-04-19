@@ -571,15 +571,9 @@ function checkSchedules(): void {
       }
       recentlyFired.set(job.id, now);
 
-      // Fire the job — short Telegram reminder so the user sees it
-      const reminderText = job.label && job.label !== job.text ? `⏰ ${job.label}` : `⏰ ${job.text}`;
-      void bot.api.sendMessage(job.chat_id, reminderText).catch((err) => {
-        process.stderr.write(`telegram channel: schedule fire failed: ${err}\n`);
-      });
-
-      // Also push the full task text as an MCP channel notification so Claude
-      // actually executes the task (plain Telegram message would only be shown
-      // to the user, not injected back into the Claude session).
+      // Push the full task text as an MCP channel notification so Claude
+      // actually executes the task. No Telegram reminder — Claude's response
+      // is the only user-visible signal.
       void mcp.notification({
         method: "notifications/claude/channel",
         params: {
