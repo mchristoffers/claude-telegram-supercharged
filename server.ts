@@ -2989,7 +2989,14 @@ async function promotePregateBuffer(chatId: string): Promise<void> {
 // collect them into a batch and send ONE combined notification to Claude.
 // This prevents Claude from responding to each message individually.
 
-const BATCH_WINDOW_MS = 5000; // 5 seconds of silence before flushing
+// Debounce window between receiving a Telegram message and pushing it to
+// Claude. Not for human follow-up typing (too slow for that anyway) — it
+// exists to coalesce automatic bursts Telegram emits as separate events:
+// forwarded messages (3 PDFs in a row), album photos (4 images = 4 updates
+// arriving within ~1s), voice + caption combos. Without this debounce every
+// item triggers its own Claude run and you get N parallel responses. Raise
+// if you notice bursts still splitting; lower for snappier latency.
+const BATCH_WINDOW_MS = 1000;
 
 interface BatchedMessage {
   text: string;

@@ -9,12 +9,14 @@ allowed-tools:
   - Bash(git add*)
   - Bash(git commit*)
   - Bash(git push*)
+  - Bash(docker restart*)
+  - Bash(docker ps*)
   - Bash(docker exec*)
 ---
 
 # /ship — Deploy a change to Kackstein
 
-Run this after **every** finished code change in `claude-telegram-supercharged`. The repo is volume-mounted into the `personal-claude-1` container, so the file change is on disk already — the daemon just needs to reload.
+Run this after **every** finished code change in `claude-telegram-supercharged`. The repo is volume-mounted into the `personal-claude-1` container, but the running bot loads from the plugin cache at `/root/.claude/plugins/cache/claude-plugins-official/telegram/<version>/`. The container's entrypoint overlays our `server.ts`/`skills/` on top of that cache on every startup — so a **container restart** is what guarantees the new code is live. Killing just the claude process inside won't reapply the overlay and leaves you deploying a stale cached version.
 
 ## Steps
 
@@ -37,11 +39,11 @@ Run this after **every** finished code change in `claude-telegram-supercharged`.
    git push origin master
    ```
 
-5. **Restart Kackstein** so the daemon picks up the change:
+5. **Restart Kackstein** so the entrypoint re-runs the plugin-cache overlay:
    ```bash
-   docker exec personal-claude-1 bash -c "kill \$(pgrep -f 'claude --channels')"
+   docker restart personal-claude-1
    ```
-   The supervisor inside the container auto-respawns Claude with the fresh code. No follow-up command needed.
+   This re-applies `entrypoint.sh` which copies `/opt/telegram-supercharged/server.ts` and `skills/` into the active plugin cache dir, then the supervisor respawns Claude with fresh code. Takes ~5-10s before the bot is back online.
 
 6. **Report** to Moritz in one line: commit hash + what shipped + "kackstein restarted". Don't recap the diff — he just read it.
 
@@ -54,4 +56,4 @@ Run this after **every** finished code change in `claude-telegram-supercharged`.
 ## If the push or restart fails
 
 - **Push rejected**: probably new upstream commits. `git pull --rebase upstream master` (or `origin master` if the user pushed from elsewhere), resolve, retry. Do not force-push.
-- **Restart fails (no matching pgrep)**: container may be down. Check `docker ps | grep personal-claude` before declaring the deploy broken.
+- **Container restart fails**: check `docker ps -a | grep personal-claude` — if the container is missing or stuck, the compose project in `/home/moritz/git/mchristoffers/personal/` is where it's defined. Don't rebuild from /ship; report to the user.
