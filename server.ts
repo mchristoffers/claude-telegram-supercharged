@@ -841,7 +841,11 @@ type Access = {
   autoTranscribe?: boolean;
   /** Tool names whose permission_requests are auto-allowed without a Telegram round-trip. */
   autoApproveTools?: string[];
+  /** Chat IDs that have already received a one-time "unregistered" notice. Prevents re-spamming. FIFO-capped. */
+  notifiedDrops?: string[];
 };
+
+const NOTIFIED_DROPS_CAP = 50;
 
 function defaultAccess(): Access {
   return {
@@ -948,6 +952,7 @@ function readAccessFile(): Access {
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
       autoTranscribe: parsed.autoTranscribe,
+      notifiedDrops: parsed.notifiedDrops ?? [],
     };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return defaultAccess();
@@ -1011,7 +1016,8 @@ type GateResult =
   | { action: "deliver"; access: Access }
   | { action: "drop" }
   | { action: "buffer"; access: Access }
-  | { action: "pair"; code: string; isResend: boolean };
+  | { action: "pair"; code: string; isResend: boolean }
+  | { action: "notify-group"; groupId: string };
 
 function gate(ctx: Context): GateResult {
   const access = loadAccess();
@@ -1062,31 +1068,13 @@ function gate(ctx: Context): GateResult {
       const title = (ctx.chat as any)?.title ?? "unknown";
       process.stderr.write(`telegram channel: unregistered group "${title}" (chat_id=${groupId})\n`);
 
-      // Group pairing — same flow as DM pairing.
-      // Check for existing pending code for this group.
-      for (const [code, p] of Object.entries(access.pending)) {
-        if (p.chatId === groupId && p.type === "group") {
-          if ((p.replies ?? 1) >= 2) return { action: "drop" };
-          p.replies = (p.replies ?? 1) + 1;
-          saveAccess(access);
-          return { action: "pair", code, isResend: true };
-        }
-      }
-      if (Object.keys(access.pending).length >= 6) return { action: "drop" };
-
-      const code = randomBytes(3).toString("hex");
-      const now = Date.now();
-      access.pending[code] = {
-        senderId,
-        chatId: groupId,
-        createdAt: now,
-        expiresAt: now + 60 * 60 * 1000,
-        replies: 1,
-        type: "group",
-        groupTitle: title,
-      };
+      // One-time notification per chat_id with the exact command to run.
+      const notified = access.notifiedDrops ?? [];
+      if (notified.includes(groupId)) return { action: "drop" };
+      const updated = [...notified, groupId];
+      access.notifiedDrops = updated.length > NOTIFIED_DROPS_CAP ? updated.slice(-NOTIFIED_DROPS_CAP) : updated;
       saveAccess(access);
-      return { action: "pair", code, isResend: false };
+      return { action: "notify-group", groupId };
     }
     const groupAllowFrom = policy.allowFrom ?? [];
     const requireMention = policy.requireMention ?? true;
@@ -2975,6 +2963,13 @@ async function handleInbound(
   if (result.action === "pair") {
     const lead = result.isResend ? "Still pending" : "Pairing required";
     await ctx.reply(`${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}`);
+    return;
+  }
+
+  if (result.action === "notify-group") {
+    await ctx.reply(
+      `This group isn't registered with Claude. Run in Claude Code:\n\n/telegram:access group add ${result.groupId}`,
+    );
     return;
   }
 
