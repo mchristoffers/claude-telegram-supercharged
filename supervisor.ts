@@ -114,8 +114,21 @@ async function killChild(child: ChildProcess): Promise<void> {
 	});
 }
 
-function startClaude(): void {
+async function startClaude(): Promise<void> {
 	if (shuttingDown) return;
+
+	// Kill any orphaned claude + MCP server processes before spawning fresh.
+	await cleanupOrphans();
+
+	// Brute-force kill any remaining bun server.ts (MCP) processes that
+	// slipped past cleanupOrphans (different process-tree ancestry).
+	try {
+		const { execSync } = await import("node:child_process");
+		execSync(
+			"pkill -9 -f 'bun server.ts' || true; pkill -9 -f 'bun run.*--silent start' || true",
+			{ encoding: "utf-8" },
+		);
+	} catch {}
 
 	const uptime = Date.now() - lastStartTime;
 	if (lastStartTime > 0 && uptime > STABLE_UPTIME_MS) {
@@ -240,26 +253,40 @@ async function shutdown(sig: string): Promise<void> {
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
-// Kill any orphaned claude --channels telegram processes from previous runs
+// Kill any orphaned claude + bun server.ts (MCP) processes from previous runs
 async function cleanupOrphans(): Promise<void> {
 	const { execSync } = await import("node:child_process");
 	try {
 		const myPid = process.pid;
-		// Find claude processes with telegram channel flag, excluding our own PID
-		const result = execSync(
-			`pgrep -f 'claude.*--channels.*telegram' || true`,
-			{ encoding: "utf-8" },
-		).trim();
-		if (!result) return;
 
-		const pids = result
-			.split("\n")
-			.map((p) => Number.parseInt(p.trim(), 10))
-			.filter((p) => !Number.isNaN(p) && p !== myPid);
+		// Hunt for both orphaned Claude sessions AND stale MCP server processes.
+		// Stale bun server.ts holds the Telegram-daemon sqlite lock + telegram.lock,
+		// so the next supervisor start crashes unless we reap them first.
+		const patterns = [
+			"claude.*--channels.*telegram",
+			"bun server\\.ts",
+			"bun run.*--silent start",
+		];
+		const allPids: number[] = [];
+
+		for (const pattern of patterns) {
+			const result = execSync(`pgrep -f '${pattern}' || true`, {
+				encoding: "utf-8",
+			}).trim();
+			if (!result) continue;
+			const pids = result
+				.split("\n")
+				.map((p) => Number.parseInt(p.trim(), 10))
+				.filter((p) => !Number.isNaN(p) && p !== myPid);
+			allPids.push(...pids);
+		}
+
+		if (allPids.length === 0) return;
+		const uniquePids = [...new Set(allPids)];
 
 		// Filter out interactive sessions (processes with a TTY are user terminals)
 		const orphanPids: number[] = [];
-		for (const pid of pids) {
+		for (const pid of uniquePids) {
 			try {
 				const tty = execSync(`ps -p ${pid} -o tty=`, {
 					encoding: "utf-8",
@@ -363,6 +390,4 @@ log(`signal file: ${SIGNAL_FILE}`);
 log(`claude args: ${[...BASE_ARGS, ...EXTRA_ARGS].join(" ")}`);
 startWatching();
 startContextWatchdog();
-void cleanupOrphans().then(() => {
-	startClaude();
-});
+void startClaude();
