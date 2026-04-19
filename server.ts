@@ -540,6 +540,11 @@ function computeNextFire(job: ScheduledJob): string {
   return job.next_fire;
 }
 
+// Track recently fired jobs to prevent duplicate fires within a short window.
+// Happens when the 30s timer races with signal-triggered restart recovery.
+const recentlyFired = new Map<string, number>();
+const FIRE_COOLDOWN_MS = 120_000;
+
 /** Check and fire due scheduled jobs. Called every 30s by the timer loop. */
 function checkSchedules(): void {
   const jobs = loadSchedules();
@@ -547,14 +552,48 @@ function checkSchedules(): void {
   const toKeep: ScheduledJob[] = [];
   let changed = false;
 
+  // Evict stale cooldown entries
+  for (const [id, ts] of recentlyFired) {
+    if (now - ts > FIRE_COOLDOWN_MS) recentlyFired.delete(id);
+  }
+
   for (const job of jobs) {
     const fireTime = new Date(job.next_fire).getTime();
     if (fireTime <= now) {
-      // Fire the job — send a clean single-line reminder
+      // Dedup: skip if this job just fired, but still advance recurring jobs
+      if (recentlyFired.has(job.id)) {
+        if (!job.one_shot) {
+          job.next_fire = computeNextFire(job);
+          toKeep.push(job);
+        }
+        changed = true;
+        continue;
+      }
+      recentlyFired.set(job.id, now);
+
+      // Fire the job — short Telegram reminder so the user sees it
       const reminderText = job.label && job.label !== job.text ? `⏰ ${job.label}` : `⏰ ${job.text}`;
       void bot.api.sendMessage(job.chat_id, reminderText).catch((err) => {
         process.stderr.write(`telegram channel: schedule fire failed: ${err}\n`);
       });
+
+      // Also push the full task text as an MCP channel notification so Claude
+      // actually executes the task (plain Telegram message would only be shown
+      // to the user, not injected back into the Claude session).
+      void mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: `SCHEDULED TASK FIRED (${job.label || job.id}): ${job.text}`,
+          meta: {
+            chat_id: job.chat_id,
+            user: "scheduler",
+            user_id: "system",
+            ts: new Date().toISOString(),
+            event_type: "schedule_fire",
+          },
+        },
+      });
+
       changed = true;
 
       if (job.one_shot) {
