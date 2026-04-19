@@ -13,9 +13,12 @@ import { Database } from "bun:sqlite";
 import { execSync, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -132,7 +135,7 @@ const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "pNInz6obpgDQGcFmaJgB";
 const OPENAI_WHISPER_MODEL = process.env.OPENAI_WHISPER_MODEL || "whisper-1";
-const ROUTER_MODEL = process.env.TELEGRAM_ROUTER_MODEL || "sonnet";
+const ROUTER_MODEL = process.env.TELEGRAM_ROUTER_MODEL || "haiku";
 const IS_HAIKU_ROUTER = ROUTER_MODEL === "haiku";
 
 if (!TOKEN) {
@@ -1220,6 +1223,274 @@ function chunk(text: string, limit: number, mode: "length" | "newline"): string[
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
 
+// ── Live tail ─────────────────────────────────────────────────────
+// Programmatically tails the Claude Code session JSONL after each
+// reply, editing the bot's just-sent message every second to show
+// the latest ~10 activity lines (tool calls, results, snippets) so
+// the user sees what Claude is doing in real time.
+//
+// Stops when Claude's session goes idle (end_turn + brief silence),
+// when Claude calls reply/edit_message again (replaced/cancelled),
+// or after a hard 5-minute cap.
+
+const LIVE_TAIL_INTERVAL_MS = 1000;
+const LIVE_TAIL_MAX_DURATION_MS = 5 * 60 * 1000;
+const LIVE_TAIL_IDLE_STOP_MS = 4000;
+const LIVE_TAIL_MAX_LINES = 10;
+const LIVE_TAIL_MAX_EVENTS = 50;
+
+interface LiveTail {
+  chat_id: string;
+  message_id: number;
+  originalText: string;
+  parseMode: "MarkdownV2" | "HTML" | undefined;
+  jsonlPath: string;
+  jsonlOffset: number;
+  startedAt: number;
+  events: string[];
+  idleSince: number | null;
+  timer: ReturnType<typeof setInterval>;
+  editing: boolean;
+  lastSnapshot: string;
+}
+
+let currentLiveTail: LiveTail | null = null;
+
+function getCurrentSessionJsonl(): string | null {
+  try {
+    const projectsDir = join(homedir(), ".claude", "projects");
+    const encoded = process.cwd().replace(/\//g, "-");
+    const dir = join(projectsDir, encoded);
+    if (!existsSync(dir)) return null;
+    const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
+    if (files.length === 0) return null;
+    let newest: { path: string; mtime: number } | null = null;
+    for (const f of files) {
+      const p = join(dir, f);
+      try {
+        const s = statSync(p);
+        if (!newest || s.mtimeMs > newest.mtime) newest = { path: p, mtime: s.mtimeMs };
+      } catch {}
+    }
+    return newest?.path ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function readNewJsonlEntries(path: string, fromOffset: number): { entries: any[]; newOffset: number } {
+  try {
+    const stat = statSync(path);
+    // File got truncated/rotated — rewind to current size so we don't hang.
+    if (stat.size < fromOffset) return { entries: [], newOffset: stat.size };
+    if (stat.size === fromOffset) return { entries: [], newOffset: fromOffset };
+    const fd = openSync(path, "r");
+    const len = stat.size - fromOffset;
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, fromOffset);
+    closeSync(fd);
+    const text = buf.toString("utf-8");
+    const lastNewline = text.lastIndexOf("\n");
+    if (lastNewline < 0) return { entries: [], newOffset: fromOffset };
+    const usable = text.slice(0, lastNewline + 1);
+    const newOffset = fromOffset + Buffer.byteLength(usable, "utf-8");
+    const entries: any[] = [];
+    for (const line of usable.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        entries.push(JSON.parse(line));
+      } catch {}
+    }
+    return { entries, newOffset };
+  } catch {
+    return { entries: [], newOffset: fromOffset };
+  }
+}
+
+function compactToolArgs(input: any): string {
+  if (input == null) return "";
+  if (typeof input === "string") return input;
+  if (typeof input !== "object") return String(input);
+  // Pull the most informative single field for common tools.
+  if (typeof input.command === "string") return input.command;
+  if (typeof input.file_path === "string") return input.file_path;
+  if (typeof input.path === "string") return input.path;
+  if (typeof input.pattern === "string") return input.pattern;
+  if (typeof input.url === "string") return input.url;
+  if (typeof input.query === "string") return input.query;
+  if (typeof input.prompt === "string") return input.prompt;
+  if (typeof input.description === "string") return input.description;
+  try {
+    return JSON.stringify(input);
+  } catch {
+    return "";
+  }
+}
+
+// Skip the bot's own outbound actions — they're visible to the user already
+// and would just clutter the live feed.
+const LIVE_TAIL_TOOL_DENY = /telegram|^reply$|^edit_message$|^react$|^voice_reply$|^ask_user$|^schedule$|^save_memory$|^create_telegraph_page$/i;
+
+function entryToActivityLine(entry: any): string | null {
+  if (!entry) return null;
+  if (entry.type !== "assistant" && entry.type !== "user") return null;
+  const ts = entry.timestamp ? new Date(entry.timestamp).toISOString().slice(11, 19) : "--:--:--";
+  const content = entry.message?.content;
+  if (!Array.isArray(content)) return null;
+  for (const block of content) {
+    if (block?.type === "tool_use") {
+      const name = String(block.name || "?");
+      if (LIVE_TAIL_TOOL_DENY.test(name)) return null;
+      const shortName = name.replace(/^mcp__[^_]+__/, "").replace(/^mcp__/, "");
+      const args = compactToolArgs(block.input).replace(/\s+/g, " ").slice(0, 70);
+      return `${ts} 🔧 ${shortName} ${args}`.trim();
+    }
+    if (block?.type === "tool_result") {
+      const raw = typeof block.content === "string"
+        ? block.content
+        : Array.isArray(block.content)
+          ? block.content.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join(" ")
+          : "";
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping ANSI escapes is the point
+      const clean = raw.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\s+/g, " ").trim();
+      if (!clean) return null;
+      return `${ts} ✓ ${clean.slice(0, 70)}`;
+    }
+    if (block?.type === "thinking") {
+      return `${ts} 💭 thinking…`;
+    }
+    if (block?.type === "text") {
+      const t = String(block.text || "").replace(/\s+/g, " ").trim();
+      if (!t) continue;
+      return `${ts} 💬 ${t.slice(0, 70)}`;
+    }
+  }
+  return null;
+}
+
+function formatLiveSnapshot(events: string[], status: "live" | "done"): string {
+  const tail = events.slice(-LIVE_TAIL_MAX_LINES);
+  const safe = tail.map((e) => e.replace(/`/g, "'"));
+  const header = status === "live" ? "📡 Live" : "✅ Done";
+  return `\n\n${header}\n\`\`\`\n${safe.join("\n")}\n\`\`\``;
+}
+
+async function applyLiveEdit(t: LiveTail, status: "live" | "done"): Promise<void> {
+  if (t.events.length === 0) return;
+  const snapshot = formatLiveSnapshot(t.events, status);
+  if (snapshot === t.lastSnapshot) return;
+  const fullText = t.originalText + snapshot;
+  const escaped = t.parseMode === "MarkdownV2" ? escapeMarkdownV2(fullText) : fullText;
+  try {
+    await bot.api.editMessageText(
+      t.chat_id,
+      t.message_id,
+      escaped,
+      t.parseMode ? { parse_mode: t.parseMode } : undefined,
+    );
+    t.lastSnapshot = snapshot;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("message is not modified")) {
+      t.lastSnapshot = snapshot;
+      return;
+    }
+    // Fatal — message gone or unparseable — stop tailing this one.
+    if (
+      msg.includes("MESSAGE_TOO_LONG") ||
+      msg.includes("message to edit not found") ||
+      msg.includes("can't parse entities") ||
+      msg.includes("MESSAGE_ID_INVALID")
+    ) {
+      if (currentLiveTail === t) {
+        clearInterval(t.timer);
+        currentLiveTail = null;
+      }
+    }
+    // Other errors (rate-limit etc.) — let the next tick retry.
+  }
+}
+
+async function liveTailTick(): Promise<void> {
+  const t = currentLiveTail;
+  if (!t || t.editing) return;
+
+  if (Date.now() - t.startedAt > LIVE_TAIL_MAX_DURATION_MS) {
+    t.editing = true;
+    try { await applyLiveEdit(t, "done"); } finally { t.editing = false; }
+    if (currentLiveTail === t) {
+      clearInterval(t.timer);
+      currentLiveTail = null;
+    }
+    return;
+  }
+
+  const { entries, newOffset } = readNewJsonlEntries(t.jsonlPath, t.jsonlOffset);
+  t.jsonlOffset = newOffset;
+
+  for (const e of entries) {
+    const line = entryToActivityLine(e);
+    if (line) {
+      t.events.push(line);
+      if (t.events.length > LIVE_TAIL_MAX_EVENTS) t.events.shift();
+    }
+    if (e?.message?.stop_reason === "end_turn") {
+      if (t.idleSince == null) t.idleSince = Date.now();
+    } else if (e?.type === "assistant" || e?.type === "user") {
+      t.idleSince = null;
+    }
+  }
+
+  if (t.idleSince != null && Date.now() - t.idleSince >= LIVE_TAIL_IDLE_STOP_MS) {
+    t.editing = true;
+    try { await applyLiveEdit(t, "done"); } finally { t.editing = false; }
+    if (currentLiveTail === t) {
+      clearInterval(t.timer);
+      currentLiveTail = null;
+    }
+    return;
+  }
+
+  t.editing = true;
+  try { await applyLiveEdit(t, "live"); } finally { t.editing = false; }
+}
+
+function startLiveTail(opts: {
+  chat_id: string;
+  message_id: number;
+  originalText: string;
+  parseMode: "MarkdownV2" | "HTML" | undefined;
+}): void {
+  // Finalize any running tail before replacing it.
+  void stopLiveTail(true);
+  const jsonlPath = getCurrentSessionJsonl();
+  if (!jsonlPath) return;
+  let offset = 0;
+  try { offset = statSync(jsonlPath).size; } catch { return; }
+  const tail: LiveTail = {
+    ...opts,
+    jsonlPath,
+    jsonlOffset: offset,
+    startedAt: Date.now(),
+    events: [],
+    idleSince: null,
+    timer: setInterval(() => void liveTailTick(), LIVE_TAIL_INTERVAL_MS),
+    editing: false,
+    lastSnapshot: "",
+  };
+  currentLiveTail = tail;
+}
+
+async function stopLiveTail(finalize: boolean): Promise<void> {
+  const t = currentLiveTail;
+  if (!t) return;
+  clearInterval(t.timer);
+  currentLiveTail = null;
+  if (finalize && t.events.length > 0 && !t.editing) {
+    try { await applyLiveEdit(t, "done"); } catch {}
+  }
+}
+
 const mcp = new Server(
   { name: "telegram", version: "1.0.0" },
   {
@@ -1762,6 +2033,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           });
         }
 
+        // Start a live tail on the just-sent message so the user sees what
+        // Claude is doing in real time. Only for single-chunk text replies
+        // without attachments — chunked/file replies are usually the answer
+        // itself and don't need a live trace.
+        if (chunks.length === 1 && files.length === 0 && sentIds.length === 1) {
+          startLiveTail({
+            chat_id,
+            message_id: sentIds[0],
+            originalText: text,
+            parseMode,
+          });
+        } else {
+          // A new reply with attachments/chunks finalizes any active tail.
+          void stopLiveTail(true);
+        }
+
         const result =
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
@@ -1791,6 +2078,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         assertAllowedChat(args.chat_id as string);
         const editParseMode = (args.parse_mode as string | undefined) ?? "MarkdownV2";
         const editParseModeOpt = editParseMode === "plain" ? undefined : (editParseMode as "MarkdownV2" | "HTML");
+        // If Claude is editing the same message we're live-tailing, hand
+        // control back — Claude's edit is authoritative.
+        if (
+          currentLiveTail &&
+          String(currentLiveTail.chat_id) === String(args.chat_id) &&
+          currentLiveTail.message_id === Number(args.message_id)
+        ) {
+          await stopLiveTail(false);
+        }
         const editText =
           editParseModeOpt === "MarkdownV2" ? escapeMarkdownV2(args.text as string) : (args.text as string);
         const edited = await bot.api.editMessageText(

@@ -37,8 +37,8 @@ const SIGNAL_FILE = join(DATA_DIR, "restart.signal");
 const CLAUDE_CMD = "claude";
 // Router model: configurable via TELEGRAM_ROUTER_MODEL env var.
 // Options: "haiku" (fast, 200K context), "sonnet" (balanced, 1M context), "opus" (deep, 1M context)
-// Default: "sonnet" — best balance of speed and context window.
-const ROUTER_MODEL = process.env.TELEGRAM_ROUTER_MODEL || "sonnet";
+// Default: "haiku" — fast first-touch; the router hands heavy work to Opus subagents.
+const ROUTER_MODEL = process.env.TELEGRAM_ROUTER_MODEL || "haiku";
 const BASE_ARGS = [
 	"--channels",
 	"plugin:telegram@claude-plugins-official",
