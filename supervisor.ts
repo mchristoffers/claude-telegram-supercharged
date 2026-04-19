@@ -21,6 +21,7 @@ import {
 	openSync,
 	readFileSync,
 	readSync,
+	renameSync,
 	rmSync,
 	statSync,
 	unwatchFile,
@@ -57,6 +58,27 @@ const CONTEXT_CHECK_INTERVAL_MS = 30_000; // Check context every 30s
 const CONTEXT_THRESHOLD_PCT = 50; // Auto-restart when context exceeds 50% — keeps sessions fresh
 const MAX_SESSION_UPTIME_MS = 2 * 60 * 60 * 1000; // Force restart after 2 hours regardless of context
 const STDOUT_LOG = join(DATA_DIR, "supervisor-stdout.log");
+// Auth-error backoff: when Claude's stdout shows "Please run /login" or
+// an authentication_error, the refresh endpoint is likely rate-limited.
+// Continuing to respawn Claude just deepens the rate-limit window.
+// Sit still for AUTH_BACKOFF_MS so the window clears, then try again.
+const AUTH_BACKOFF_MS = 20 * 60 * 1000;
+const AUTH_CHECK_INTERVAL_MS = 15_000;
+const AUTH_ERROR_PATTERNS = [
+	/Please run \/login/i,
+	/authentication_error/i,
+	/Invalid authentication credentials/i,
+];
+// Proactive OAuth token refresh — prevents Claude from ever hitting a 401.
+// Daemon context amplifies reactive refresh (Claude-on-401) into retry
+// storms that rate-limit the per-IP /v1/oauth/token endpoint, which
+// manifests as bogus "/login" prompts even on still-valid tokens.
+const CREDS_FILE = join(homedir(), ".claude", ".credentials.json");
+const OAUTH_TOKEN_ENDPOINT = "https://console.anthropic.com/v1/oauth/token";
+const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const REFRESH_MAX_INTERVAL_MS = 4 * 60 * 60 * 1000; // cap at 4h
+const REFRESH_MIN_INTERVAL_MS = 5 * 60 * 1000; // floor at 5min (on failure)
+const REFRESH_SAFETY_MARGIN_MS = 10 * 60 * 1000; // aim to refresh this long before expiry
 // Delay before restart to let Claude finish sending Telegram replies
 const RESTART_DELAY_MS = 3_000;
 
@@ -65,6 +87,11 @@ let restartCount = 0;
 let lastStartTime = 0;
 let shuttingDown = false;
 let pendingRestart = false;
+let authBackoffUntil = 0;
+let lastAuthTrigger = 0;
+let authScanCursor = 0; // byte offset — skip log content we've already evaluated
+let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+let consecutiveRefreshFails = 0;
 
 function log(msg: string): void {
 	process.stderr.write(
@@ -116,6 +143,17 @@ async function killChild(child: ChildProcess): Promise<void> {
 
 async function startClaude(): Promise<void> {
 	if (shuttingDown) return;
+
+	// If we're still in auth backoff, defer the spawn. The refresh endpoint
+	// is almost certainly rate-limited per-IP; respawning now would just
+	// extend the window.
+	const now = Date.now();
+	if (authBackoffUntil > now) {
+		const waitMs = authBackoffUntil - now;
+		log(`auth backoff active — deferring spawn by ${Math.round(waitMs / 1000)}s`);
+		setTimeout(startClaude, waitMs);
+		return;
+	}
 
 	// Kill any orphaned claude + MCP server processes before spawning fresh.
 	await cleanupOrphans();
@@ -383,6 +421,201 @@ function startContextWatchdog(): void {
 	}, CONTEXT_CHECK_INTERVAL_MS);
 }
 
+// ── Auth watchdog ─────────────────────────────────────────────────
+// Scans the stdout log for auth errors ("Please run /login",
+// authentication_error, 401). When found, sets a long backoff so
+// we don't keep hammering the refresh endpoint, and kills the
+// current Claude so the proactive-refresh cron can take over
+// rotating the tokens (via restart.signal + fresh .credentials.json).
+
+let authWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+
+function startAuthWatchdog(): void {
+	if (authWatchdogTimer) return;
+	authWatchdogTimer = setInterval(() => {
+		if (shuttingDown) return;
+		if (Date.now() < authBackoffUntil) return;
+		if (Date.now() - lastAuthTrigger < 60_000) return;
+		try {
+			const stat = statSync(STDOUT_LOG);
+			// Log was truncated (rotated / fresh start) — rewind cursor
+			if (stat.size < authScanCursor) authScanCursor = 0;
+			// Only look at content appended since our last scan, capped at 16KB
+			const unread = stat.size - authScanCursor;
+			if (unread <= 0) return;
+			const readSize = Math.min(unread, 16384);
+			const fd = openSync(STDOUT_LOG, "r");
+			const buf = Buffer.alloc(readSize);
+			readSync(fd, buf, 0, readSize, stat.size - readSize);
+			closeSync(fd);
+			// Advance cursor — prevents re-triggering on stale log content
+			authScanCursor = stat.size;
+			const chunk = buf.toString("utf-8");
+			if (!AUTH_ERROR_PATTERNS.some((p) => p.test(chunk))) return;
+
+			lastAuthTrigger = Date.now();
+			authBackoffUntil = Date.now() + AUTH_BACKOFF_MS;
+			log(
+				`auth error detected in stdout — backoff ${Math.round(AUTH_BACKOFF_MS / 60000)}min (until ${new Date(authBackoffUntil).toISOString()})`,
+			);
+			// Kill the current Claude so it stops retrying. startClaude's
+			// backoff check will defer respawn until the window elapses.
+			if (currentChild) {
+				void killChild(currentChild);
+			}
+		} catch {
+			// log missing or unreadable — ignore
+		}
+	}, AUTH_CHECK_INTERVAL_MS);
+}
+
+// ── Proactive OAuth refresh ───────────────────────────────────────
+// Reads .credentials.json, calls the refresh endpoint, writes new
+// tokens atomically, then triggers a graceful Claude restart via
+// restart.signal so the spawned process picks up the fresh tokens
+// from disk. Reschedules adaptively off the new expiry.
+
+interface ClaudeCreds {
+	claudeAiOauth?: {
+		accessToken?: string;
+		refreshToken?: string;
+		expiresAt?: number;
+		[k: string]: unknown;
+	};
+	[k: string]: unknown;
+}
+
+function readCreds(): ClaudeCreds | null {
+	try {
+		return JSON.parse(readFileSync(CREDS_FILE, "utf-8")) as ClaudeCreds;
+	} catch (err) {
+		log(`refresh: cannot read ${CREDS_FILE}: ${err}`);
+		return null;
+	}
+}
+
+async function refreshTokens(): Promise<boolean> {
+	const creds = readCreds();
+	const refreshToken = creds?.claudeAiOauth?.refreshToken;
+	if (!creds || !refreshToken) {
+		log("refresh: no refresh_token in credentials file");
+		return false;
+	}
+
+	let resp: Response;
+	try {
+		resp = await fetch(OAUTH_TOKEN_ENDPOINT, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				grant_type: "refresh_token",
+				refresh_token: refreshToken,
+				client_id: OAUTH_CLIENT_ID,
+			}),
+			signal: AbortSignal.timeout(15_000),
+		});
+	} catch (err) {
+		log(`refresh: network error — ${err}`);
+		return false;
+	}
+
+	if (!resp.ok) {
+		const body = await resp.text().catch(() => "");
+		log(`refresh: HTTP ${resp.status} — ${body.slice(0, 200)}`);
+		return false;
+	}
+
+	let data: {
+		access_token?: string;
+		refresh_token?: string;
+		expires_in?: number;
+	};
+	try {
+		data = (await resp.json()) as typeof data;
+	} catch (err) {
+		log(`refresh: invalid JSON response — ${err}`);
+		return false;
+	}
+
+	if (!data.access_token || !data.refresh_token || !data.expires_in) {
+		log(`refresh: response missing fields — ${JSON.stringify(data).slice(0, 200)}`);
+		return false;
+	}
+
+	// Preserve any other fields Claude may add (subscriptionType, scopes, etc.)
+	const oauth = creds.claudeAiOauth ?? {};
+	oauth.accessToken = data.access_token;
+	oauth.refreshToken = data.refresh_token;
+	oauth.expiresAt = Date.now() + data.expires_in * 1000;
+	creds.claudeAiOauth = oauth;
+
+	// Atomic write: temp in same dir → rename
+	const tmp = `${CREDS_FILE}.tmp.${process.pid}.${Date.now()}`;
+	try {
+		writeFileSync(tmp, JSON.stringify(creds, null, 2), { mode: 0o600 });
+		renameSync(tmp, CREDS_FILE);
+	} catch (err) {
+		log(`refresh: write failed — ${err}`);
+		try {
+			rmSync(tmp, { force: true });
+		} catch {}
+		return false;
+	}
+
+	const expiresIso = new Date(oauth.expiresAt as number).toISOString();
+	log(`refresh: OK — new access token expires ${expiresIso}`);
+	return true;
+}
+
+function scheduleNextRefresh(): void {
+	if (refreshTimer) {
+		clearTimeout(refreshTimer);
+		refreshTimer = null;
+	}
+	const creds = readCreds();
+	const expiresAt = creds?.claudeAiOauth?.expiresAt ?? 0;
+	const timeLeft = expiresAt - Date.now();
+
+	// Normal schedule: refresh at (lifetime - safety margin).
+	// On consecutive failures, switch to growing backoff so we don't hammer
+	// a rate-limited endpoint — 10min, 15min, 20min, ... capped later.
+	let delay =
+		consecutiveRefreshFails > 0
+			? REFRESH_MIN_INTERVAL_MS * (1 + consecutiveRefreshFails)
+			: timeLeft - REFRESH_SAFETY_MARGIN_MS;
+	delay = Math.max(REFRESH_MIN_INTERVAL_MS, Math.min(REFRESH_MAX_INTERVAL_MS, delay));
+
+	log(
+		`refresh: next attempt in ${Math.round(delay / 60000)}min (token ${timeLeft > 0 ? `valid ${Math.round(timeLeft / 60000)}min` : "EXPIRED"}, fails=${consecutiveRefreshFails})`,
+	);
+	refreshTimer = setTimeout(() => void refreshCycle(), delay);
+}
+
+async function refreshCycle(): Promise<void> {
+	const ok = await refreshTokens();
+	if (ok) {
+		consecutiveRefreshFails = 0;
+		// Rotate Claude so the fresh tokens are loaded into its process memory.
+		// Without rotation, Claude keeps using its in-memory old refresh_token —
+		// which was invalidated by the rotation in the refresh response.
+		try {
+			mkdirSync(DATA_DIR, { recursive: true });
+			writeFileSync(SIGNAL_FILE, String(Date.now() + 2000));
+		} catch (err) {
+			log(`refresh: could not signal restart — ${err}`);
+		}
+	} else {
+		consecutiveRefreshFails++;
+		if (consecutiveRefreshFails === 3) {
+			log(
+				"refresh: 3 consecutive failures — credentials may be revoked; " +
+					"run `docker exec -it personal-claude-1 claude /login` to re-auth",
+			);
+		}
+	}
+	scheduleNextRefresh();
+}
+
 // Main
 log("telegram daemon supervisor starting");
 log(`router model: ${ROUTER_MODEL} (set TELEGRAM_ROUTER_MODEL to change)`);
@@ -390,4 +623,6 @@ log(`signal file: ${SIGNAL_FILE}`);
 log(`claude args: ${[...BASE_ARGS, ...EXTRA_ARGS].join(" ")}`);
 startWatching();
 startContextWatchdog();
+startAuthWatchdog();
+scheduleNextRefresh();
 void startClaude();
