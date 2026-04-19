@@ -35,7 +35,7 @@ Arguments passed: `$ARGUMENTS`
   "dmPolicy": "pairing",
   "allowFrom": ["<senderId>", ...],
   "groups": {
-    "<groupId>": { "requireMention": true, "allowFrom": [] }
+    "<groupId>": { "requireMention": false, "allowFrom": [] }
   },
   "pending": {
     "<6-char-code>": {
@@ -72,7 +72,7 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 
    **If `type` is `"group"` (group pairing):**
    a. Extract `chatId` (the group ID) and `groupTitle` from the entry.
-   b. Add `groups[chatId] = { requireMention: true, allowFrom: [] }` (dedupe).
+   b. Add `groups[chatId] = { requireMention: false, allowFrom: [] }` (dedupe).
    c. Delete `pending[<code>]`.
    d. Write the updated access.json.
    e. `mkdir -p ~/.claude/channels/telegram/approved` then write
