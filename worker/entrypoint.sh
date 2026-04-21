@@ -57,6 +57,27 @@ if [ ! -f /workspace/CLAUDE.md ] && [ -f /opt/default-CLAUDE.md ]; then
     cp /opt/default-CLAUDE.md /workspace/CLAUDE.md
 fi
 
+# --- Bot-specific init hook ---
+# WORKER_INIT_SCRIPT is set by routing.ts when the master compose defines
+# it. The bot is responsible for providing the file (typically via
+# WORKER_EXTRA_MOUNTS). Ran after the graphical stack is up and after the
+# CLAUDE.md seed, so it can:
+#   - prepare /workspace (e.g. git worktree add)
+#   - configure git identity
+#   - launch ancillary processes in detached tmux sessions (npm dev,
+#     tunnels, watchers) so claude can see/manage them
+# Errors here are non-fatal — log and continue, the worker can still come
+# up and the user can debug from inside.
+if [ -n "${WORKER_INIT_SCRIPT:-}" ] && [ -f "$WORKER_INIT_SCRIPT" ]; then
+    mkdir -p /var/log/worker
+    echo "[entrypoint] running WORKER_INIT_SCRIPT=$WORKER_INIT_SCRIPT" \
+        >> /var/log/worker/init.log
+    # shellcheck disable=SC1090
+    bash "$WORKER_INIT_SCRIPT" >> /var/log/worker/init.log 2>&1 \
+        || echo "[entrypoint] init script exited non-zero (rc=$?), continuing" \
+            >> /var/log/worker/init.log
+fi
+
 # --- Start Claude in tmux ---
 # Worker loads the same telegram channel-plugin the master uses. Because
 # /root/.claude is shared with the master, the plugin finds the master's

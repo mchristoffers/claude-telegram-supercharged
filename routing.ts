@@ -49,6 +49,32 @@ const WORKER_IMAGE = process.env.WORKER_IMAGE ?? "personal-worker-test:latest";
 const WORKER_HOST_BASE_DIR = process.env.WORKER_HOST_BASE_DIR ?? "";
 const WORKER_SECRETS_ENV = process.env.WORKER_SECRETS_ENV ?? "/home/moritz/.secrets.env";
 
+// Generic extension hooks. Bots wrapping Supercharged use these to give
+// their workers extra mounts (source repos, host binaries, config dirs)
+// and a custom init script that runs before the in-tmux claude session
+// starts. See the consuming bot's docker-compose.yml for examples.
+//
+// WORKER_EXTRA_MOUNTS: comma-separated docker -v specs, e.g.
+//   "/host/repo:/srv/source,/host/bin/foo:/usr/local/bin/foo:ro"
+// Whitespace around entries is trimmed; empty entries are ignored.
+//
+// WORKER_INIT_SCRIPT: absolute path inside the worker container. If set,
+// the worker's entrypoint sources this file after the graphical stack is
+// up and before claude starts. The bot is responsible for mounting it in
+// via WORKER_EXTRA_MOUNTS.
+const WORKER_EXTRA_MOUNTS = process.env.WORKER_EXTRA_MOUNTS ?? "";
+const WORKER_INIT_SCRIPT = process.env.WORKER_INIT_SCRIPT ?? "";
+
+function parseExtraMounts(spec: string): string[] {
+  const args: string[] = [];
+  for (const entry of spec.split(",")) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    args.push("-v", trimmed);
+  }
+  return args;
+}
+
 export type Route = {
   chat_id: string;
   thread_id?: number;
@@ -620,12 +646,14 @@ async function dockerRun(container: string, chatId: string, threadId: number): P
     `TELEGRAM_ROLE=worker`,
     "-e",
     "TZ=Europe/Berlin",
+    ...(WORKER_INIT_SCRIPT ? ["-e", `WORKER_INIT_SCRIPT=${WORKER_INIT_SCRIPT}`] : []),
     "-v",
     `${claudeHost}:/root/.claude`,
     "-v",
     `${claudeJsonHost}:/root/.claude.json`,
     "-v",
     `${workspaceHost}:/workspace`,
+    ...parseExtraMounts(WORKER_EXTRA_MOUNTS),
     WORKER_IMAGE,
   ];
   return runDocker(args, SPAWN_TIMEOUT_MS);
