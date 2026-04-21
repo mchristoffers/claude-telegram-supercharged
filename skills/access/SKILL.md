@@ -110,10 +110,10 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 1. Validate `<mode>` is one of `pairing`, `allowlist`, `disabled`.
 2. Read (create default if missing), set `dmPolicy`, write.
 
-### `group add <groupId>` (optional: `--no-mention`, `--allow id1,id2`)
+### `group add <groupId>` (optional: `--require-mention`, `--allow id1,id2`)
 
 1. Read (create default if missing).
-2. Set `groups[<groupId>] = { requireMention: !hasFlag("--no-mention"),
+2. Set `groups[<groupId>] = { requireMention: hasFlag("--require-mention"),
    allowFrom: parsedAllowList }`.
 3. Write.
 

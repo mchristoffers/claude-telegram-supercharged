@@ -525,12 +525,12 @@ Just send a message in the group mentioning your bot (e.g. `@your_bot hello`). T
 /telegram:access pair <code>
 ```
 
-That's it. The group is registered automatically with `requireMention: true` (bot only responds when mentioned or replied to).
+That's it. The group is registered with `requireMention: false` (bot responds to every message — requires disabling BotFather privacy mode so Telegram delivers non-mention messages).
 
-To let it respond to all messages:
+To restrict the bot to only @mentions and replies:
 
 ```
-/telegram:access group update -100XXXXXXXXXX requireMention false
+/telegram:access group update -100XXXXXXXXXX requireMention true
 ```
 
 > **Manual alternative:** If you already know the group's numeric ID (starts with `-100...`), you can register directly with `/telegram:access group add -100XXXXXXXXXX`. Ways to find the ID: check the bot's stderr logs, open [web.telegram.org](https://web.telegram.org) (ID is in the URL), or forward a group message to [@RawDataBot](https://t.me/RawDataBot).

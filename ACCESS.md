@@ -51,19 +51,19 @@ Groups are off by default. Opt each one in individually.
 
 Supergroup IDs are negative numbers with a `-100` prefix, e.g. `-1001654782309`. They're not shown in the Telegram UI. To find one, either add [@RawDataBot](https://t.me/RawDataBot) to the group temporarily (it dumps a JSON blob including the chat ID), or add your bot and run `/telegram:access` to see recent dropped-from groups.
 
-With the default `requireMention: true`, the bot responds only when @mentioned or replied to. Pass `--no-mention` to process every message, or `--allow id1,id2` to restrict which members can trigger it.
+By default the bot responds to every message in the group. Pass `--require-mention` to only respond when @mentioned or replied to, or `--allow id1,id2` to restrict which members can trigger it.
 
 ```
-/telegram:access group add -1001654782309 --no-mention
+/telegram:access group add -1001654782309 --require-mention
 /telegram:access group add -1001654782309 --allow 412587349,628194073
 /telegram:access group rm -1001654782309
 ```
 
-**Privacy mode.** Telegram bots default to a server-side privacy mode that filters group messages before they reach your code: only @mentions and replies are delivered. This matches the default `requireMention: true`, so it's normally invisible. Using `--no-mention` requires disabling privacy mode as well: message [@BotFather](https://t.me/BotFather), send `/setprivacy`, pick your bot, choose **Disable**. Without that step, Telegram never delivers the messages regardless of local config.
+**Privacy mode.** Telegram bots default to a server-side privacy mode that filters group messages before they reach your code: only @mentions and replies are delivered. The default `requireMention: false` therefore requires disabling privacy mode so every message reaches the bot: message [@BotFather](https://t.me/BotFather), send `/setprivacy`, pick your bot, choose **Disable**. Without that step, Telegram only delivers @mentions and replies regardless of local config.
 
 ## Mention detection
 
-In groups with `requireMention: true`, any of the following triggers the bot:
+When `requireMention: true` is set on a group, any of the following triggers the bot:
 
 - A structured `@botusername` mention
 - A reply to one of the bot's messages
@@ -104,7 +104,7 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
 | `/telegram:access allow 412587349` | Add a user ID directly. |
 | `/telegram:access remove 412587349` | Remove from the allowlist. |
 | `/telegram:access policy allowlist` | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`. |
-| `/telegram:access group add -1001654782309` | Enable a group. Flags: `--no-mention` (also requires disabling privacy mode), `--allow id1,id2`. |
+| `/telegram:access group add -1001654782309` | Enable a group. Flags: `--require-mention`, `--allow id1,id2`. Default responds to every message (requires disabling BotFather privacy mode). |
 | `/telegram:access group rm -1001654782309` | Disable a group. |
 | `/telegram:access set ackReaction 👀` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`, `autoTranscribe`. |
 
@@ -123,9 +123,10 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
   // Groups the bot is active in. Empty object = DM-only.
   "groups": {
     "-1001654782309": {
+      // false (default): respond to every message — requires disabling
+      //   privacy mode via BotFather.
       // true: respond only to @mentions and replies.
-      // false also requires disabling privacy mode via BotFather.
-      "requireMention": true,
+      "requireMention": false,
       // Restrict triggers to these senders. Empty = any member (subject to requireMention).
       "allowFrom": []
     }
