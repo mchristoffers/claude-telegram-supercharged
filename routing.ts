@@ -65,6 +65,19 @@ const WORKER_SECRETS_ENV = process.env.WORKER_SECRETS_ENV ?? "/home/moritz/.secr
 const WORKER_EXTRA_MOUNTS = process.env.WORKER_EXTRA_MOUNTS ?? "";
 const WORKER_INIT_SCRIPT = process.env.WORKER_INIT_SCRIPT ?? "";
 
+// WORKER_POOL: identifier that scopes this master's workers, so multiple
+// supercharged bots sharing the host's docker socket don't trip over each
+// other (e.g. the worker-gateway's docker-events listener would otherwise
+// announce every `worker-*` destroy to every bot's chat). Every worker
+// spawned by this master gets `--label supercharged-pool=<pool>`, and
+// the gateway filters its events by the same label. Defaults to the
+// basename of WORKER_HOST_BASE_DIR, which is already unique per bot.
+const WORKER_POOL =
+  process.env.WORKER_POOL ??
+  (WORKER_HOST_BASE_DIR
+    ? WORKER_HOST_BASE_DIR.split("/").filter(Boolean).pop() ?? ""
+    : "");
+
 function parseExtraMounts(spec: string): string[] {
   const args: string[] = [];
   for (const entry of spec.split(",")) {
@@ -647,6 +660,7 @@ async function dockerRun(container: string, chatId: string, threadId: number): P
     "-e",
     "TZ=Europe/Berlin",
     ...(WORKER_INIT_SCRIPT ? ["-e", `WORKER_INIT_SCRIPT=${WORKER_INIT_SCRIPT}`] : []),
+    ...(WORKER_POOL ? ["--label", `supercharged-pool=${WORKER_POOL}`] : []),
     "-v",
     `${claudeHost}:/root/.claude`,
     "-v",

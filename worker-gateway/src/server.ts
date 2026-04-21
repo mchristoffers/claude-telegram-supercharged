@@ -208,20 +208,49 @@ const server = Bun.serve<BridgeWs>({
 
 startWatcher();
 
-// Docker events → Telegram. Fires when any worker-* container is destroyed
-// (manual rm, gc, compose down, crash + restart policy exhausted, …) or
-// dies with non-zero exit. One event per action, so no dedupe needed.
+// Docker events → Telegram. Fires when any of *this master's* worker-*
+// containers is destroyed (manual rm, gc, compose down, crash + restart
+// policy exhausted, …) or dies with non-zero exit. One event per action,
+// so no dedupe needed.
+//
+// Scoping: events are filtered to the docker label
+// `supercharged-pool=<WORKER_POOL>`, so masters sharing the host docker
+// socket don't announce each other's worker deaths. WORKER_POOL defaults
+// to the basename of WORKER_HOST_BASE_DIR (already unique per bot); each
+// worker gets the matching label at spawn time from routing.ts. If the
+// pool can't be determined we disable notifications entirely — better to
+// go quiet than to spam the wrong chat.
+const WORKER_HOST_BASE_DIR = process.env.WORKER_HOST_BASE_DIR ?? "";
+const WORKER_POOL =
+  process.env.WORKER_POOL ??
+  (WORKER_HOST_BASE_DIR
+    ? WORKER_HOST_BASE_DIR.split("/").filter(Boolean).pop() ?? ""
+    : "");
 (async () => {
   if (!notifyEnabled()) {
     console.log("notify: disabled (TELEGRAM_BOT_TOKEN or NOTIFY_CHAT_ID unset)");
     return;
   }
+  if (!WORKER_POOL) {
+    console.log(
+      "notify: disabled (WORKER_POOL unset and can't derive from WORKER_HOST_BASE_DIR; refusing to broadcast other masters' worker events)",
+    );
+    return;
+  }
+  const poolLabel = `supercharged-pool=${WORKER_POOL}`;
   const dockerEvents = new Docker({ socketPath: "/var/run/docker.sock" });
   const stream = await dockerEvents.getEvents({
-    filters: JSON.stringify({ type: ["container"], event: ["destroy", "die"] }),
+    filters: JSON.stringify({
+      type: ["container"],
+      event: ["destroy", "die"],
+      label: [poolLabel],
+    }),
   });
   stream.on("data", async (chunk: Buffer) => {
-    let evt: { Action?: string; Actor?: { Attributes?: { name?: string; exitCode?: string } } };
+    let evt: {
+      Action?: string;
+      Actor?: { Attributes?: { name?: string; exitCode?: string; [k: string]: string | undefined } };
+    };
     try {
       evt = JSON.parse(chunk.toString());
     } catch {
@@ -229,7 +258,12 @@ startWatcher();
     }
     const name = evt.Actor?.Attributes?.name;
     if (!name || !name.startsWith("worker-")) return;
-    console.log(`notify: ${evt.Action} ${name}`);
+    // Defense in depth: the event-stream filter should already guarantee
+    // this, but if an older worker was spawned before labelling was wired
+    // up its label is missing — skip it quietly rather than notify.
+    const eventPool = evt.Actor?.Attributes?.["supercharged-pool"];
+    if (eventPool !== WORKER_POOL) return;
+    console.log(`notify: ${evt.Action} ${name} (pool=${eventPool})`);
 
     if (evt.Action === "destroy") {
       await notify(`🗑️ Worker\\-Container entfernt: \`${md2(name)}\``);
@@ -242,7 +276,7 @@ startWatcher();
     }
   });
   stream.on("error", (err: Error) => console.error("docker events stream:", err));
-  console.log("notify: docker events listener active");
+  console.log(`notify: docker events listener active (pool=${WORKER_POOL})`);
 })().catch((err) => console.error("notify init failed:", err));
 
 console.log(`worker-gateway listening on :${server.port}`);
