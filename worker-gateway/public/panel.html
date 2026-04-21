@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <title>Kackstein Worker Panel</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+      :root {
+        --bg: #0f1216;
+        --card: #1a1f27;
+        --card-hover: #242a35;
+        --border: #2a303b;
+        --fg: #e6e8eb;
+        --muted: #8a94a5;
+        --accent: #6ad18f;
+        --warn: #d6a65a;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+        min-height: 100vh;
+      }
+      header {
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      header h1 {
+        margin: 0;
+        font-size: 16px;
+        font-weight: 600;
+      }
+      .status {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .status.ok { color: var(--accent); }
+      .status.bad { color: var(--warn); }
+      main { padding: 20px; }
+      .empty {
+        color: var(--muted);
+        text-align: center;
+        padding: 60px 20px;
+        font-size: 14px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+        gap: 14px;
+      }
+      .tile {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 14px;
+        cursor: pointer;
+        transition: background 0.1s;
+      }
+      .tile:hover { background: var(--card-hover); }
+      .tile .topic {
+        font-size: 15px;
+        font-weight: 600;
+        margin-bottom: 6px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .tile .topic em { color: var(--muted); font-style: normal; opacity: 0.8; }
+      .tile .container {
+        font-size: 11px;
+        color: var(--muted);
+        font-family: ui-monospace, "SF Mono", monospace;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        margin-bottom: 8px;
+      }
+      .tile .meta {
+        display: flex;
+        gap: 10px;
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--accent);
+        margin-right: 5px;
+      }
+      .dot.off { background: var(--warn); }
+      .modal {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.85);
+        display: flex;
+        flex-direction: column;
+        z-index: 100;
+      }
+      .modal header { background: var(--card); }
+      .modal button {
+        background: var(--border);
+        border: 0;
+        color: var(--fg);
+        padding: 6px 12px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 12px;
+      }
+      .modal iframe {
+        flex: 1;
+        border: 0;
+        width: 100%;
+        background: #000;
+      }
+      .modal-title { font-weight: 600; }
+      .modal-sub { color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; margin-left: 10px; }
+      .toast {
+        position: fixed;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: var(--warn);
+        color: #111;
+        padding: 10px 16px;
+        border-radius: 6px;
+        font-size: 13px;
+        z-index: 200;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>Kackstein Worker Panel</h1>
+        <span :class="['status', streamStatus]">{{ streamLabel }}</span>
+      </header>
+      <main>
+        <div v-if="!workers.length" class="empty">Keine laufenden Worker.</div>
+        <div v-else class="grid">
+          <div v-for="w in workers" :key="w.container" class="tile" @click="open(w)">
+            <div class="topic">
+              <template v-if="w.topic">{{ w.topic }}</template>
+              <em v-else>ohne Topic-Name</em>
+            </div>
+            <div class="container">{{ w.container }}</div>
+            <div class="meta">
+              <span><span :class="['dot', w.status === 'running' ? '' : 'off']"></span>{{ w.status }}</span>
+              <span>t{{ w.threadId }}</span>
+              <span v-if="w.ip">{{ w.ip }}</span>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <div v-if="active" class="modal">
+        <header>
+          <div>
+            <span class="modal-title">{{ active.topic || '(kein Topic-Name)' }}</span>
+            <span class="modal-sub">{{ active.container }}</span>
+          </div>
+          <button @click="close">schließen</button>
+        </header>
+        <iframe :src="'/vnc/' + encodeURIComponent(active.container)" allow="clipboard-write"></iframe>
+      </div>
+
+      <div v-if="toast" class="toast">{{ toast }}</div>
+    </div>
+
+    <script type="module">
+      import { createApp, ref, computed, onMounted } from "/vue.esm-browser.prod.js";
+
+      createApp({
+        setup() {
+          const workers = ref([]);
+          const active = ref(null);
+          const streamStatus = ref("");
+          const toast = ref("");
+
+          const streamLabel = computed(() => {
+            if (streamStatus.value === "ok") return "live";
+            if (streamStatus.value === "bad") return "reconnecting…";
+            return "connecting…";
+          });
+
+          let toastTimer = null;
+          const showToast = (msg, ms = 3500) => {
+            toast.value = msg;
+            if (toastTimer) clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => (toast.value = ""), ms);
+          };
+
+          const open = (w) => (active.value = w);
+          const close = () => (active.value = null);
+
+          const apply = (newList) => {
+            workers.value = newList;
+            if (active.value) {
+              const stillThere = newList.some((w) => w.container === active.value.container);
+              if (!stillThere) {
+                showToast(`Worker "${active.value.container}" verschwunden — neu öffnen`);
+                close();
+              }
+            }
+          };
+
+          onMounted(() => {
+            const es = new EventSource("/api/stream");
+            es.addEventListener("open", () => (streamStatus.value = "ok"));
+            es.addEventListener("message", (ev) => {
+              try {
+                const data = JSON.parse(ev.data);
+                apply(data.workers ?? []);
+              } catch (err) {
+                console.error("SSE parse:", err);
+              }
+            });
+            es.addEventListener("error", () => (streamStatus.value = "bad"));
+          });
+
+          return { workers, active, streamStatus, streamLabel, toast, open, close };
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>

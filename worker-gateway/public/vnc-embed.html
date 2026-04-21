@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <title>__CONTAINER__ — VNC</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #000; color: #ccc; font-family: -apple-system, sans-serif; }
+      #status { position: fixed; top: 6px; left: 10px; font-size: 11px; opacity: 0.7; z-index: 10; pointer-events: none; }
+      #screen { width: 100%; height: 100%; }
+    </style>
+  </head>
+  <body>
+    <div id="status">connecting…</div>
+    <div id="screen"></div>
+    <script type="module">
+      import RFB from "/novnc/core/rfb.js";
+
+      const container = "__CONTAINER__";
+      const statusEl = document.getElementById("status");
+      const screen = document.getElementById("screen");
+
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const url = `${proto}//${location.host}/ws/${encodeURIComponent(container)}`;
+
+      const rfb = new RFB(screen, url, {});
+      rfb.viewOnly = false;
+      rfb.scaleViewport = true;
+      rfb.resizeSession = false;
+
+      rfb.addEventListener("connect", () => {
+        statusEl.textContent = `connected: ${container}`;
+        setTimeout(() => (statusEl.style.display = "none"), 2000);
+      });
+      rfb.addEventListener("disconnect", (e) => {
+        statusEl.style.display = "";
+        statusEl.textContent = e.detail.clean ? "disconnected" : "connection lost";
+      });
+      rfb.addEventListener("credentialsrequired", () => {
+        statusEl.textContent = "VNC password required (not expected in this setup)";
+      });
+    </script>
+  </body>
+</html>

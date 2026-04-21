@@ -1,0 +1,10 @@
+{
+  "name": "telegram-send-mcp",
+  "version": "0.1.0",
+  "description": "Minimal stdio MCP server that replies to a Telegram bot chat. Used by per-topic worker Claude Code sessions to answer back on the shared master bot.",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  }
+}

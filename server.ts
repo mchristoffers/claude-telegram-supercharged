@@ -30,6 +30,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { Bot, type Context, InlineKeyboard, InputFile } from "grammy";
 import type { ReactionTypeEmoji } from "grammy/types";
+import { dispatchToWorker, initRouting, rememberTopic, resolveRoute, setStatusBot } from "./routing.js";
 
 const ALLOWED_REACTIONS = new Set([
   "👍",
@@ -125,6 +126,23 @@ const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === "static";
 const TELEGRAPH_ENABLED = process.env.TELEGRAPH_ENABLED === "true"; // default false — opt-in
 
+// Role gate for per-topic worker containers. The master (Kackstein) runs
+// with TELEGRAM_ROLE unset (or "master") and polls Telegram. Per-topic
+// worker containers run with TELEGRAM_ROLE=worker: they still expose the
+// reply/react/history/schedule tools, but never poll and are blocked from
+// creating/editing/closing/reopening/deleting Forum topics — the master
+// owns topic lifecycle so routes.json stays the single source of truth.
+const IS_WORKER = process.env.TELEGRAM_ROLE === "worker";
+const WORKER_DEFAULT_CHAT_ID = process.env.TELEGRAM_DEFAULT_CHAT_ID;
+const WORKER_DEFAULT_THREAD_ID = process.env.TELEGRAM_DEFAULT_THREAD_ID;
+const WORKER_BLOCKED_TOOLS = new Set([
+  "create_topic",
+  "edit_topic",
+  "close_topic",
+  "reopen_topic",
+  "delete_topic",
+]);
+
 // ── API keys for transcription chain + TTS (loaded from .env) ─────────
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
@@ -153,6 +171,16 @@ const LOCK_FILE = join(DATA_DIR, "telegram.lock");
 let isSecondary = false; // true when another instance owns the bot polling
 
 function acquireLock(): void {
+  // Worker containers MUST never poll — even if they boot during a
+  // window where the master's lock is stale, they stay secondary and
+  // never write the lock. Role is declared via env, not discovered.
+  if (IS_WORKER) {
+    isSecondary = true;
+    process.stderr.write(
+      "telegram channel: TELEGRAM_ROLE=worker — forcing MCP-only mode (no polling, no lock write)\n",
+    );
+    return;
+  }
   if (existsSync(LOCK_FILE)) {
     const existingPid = Number.parseInt(readFileSync(LOCK_FILE, "utf-8").trim(), 10);
     if (!Number.isNaN(existingPid)) {
@@ -194,6 +222,10 @@ process.on("SIGTERM", () => {
 });
 
 acquireLock();
+
+// Per-topic routing: watches routes.json and dispatches topic-scoped
+// messages to worker containers via docker exec tmux send-keys.
+initRouting();
 
 // ── Telegraph integration ─────────────────────────────────────────────
 // Publishes long-form content to telegra.ph for Instant View in Telegram.
@@ -800,6 +832,29 @@ process.on("SIGTERM", () => {
 const bot = new Bot(TOKEN);
 let botUsername = "";
 
+// Register the grammy API with routing.ts so it can post/edit spawn-
+// progress status messages in the destination topic while a new
+// worker-t<N> container is booting. Only the master primary polls, so
+// only the master ever spawns and only the master ever calls these.
+if (!IS_WORKER) {
+  setStatusBot({
+    sendMessage: async (chatId, text, opts) =>
+      bot.api.sendMessage(
+        chatId,
+        text,
+        opts?.message_thread_id != null ? { message_thread_id: opts.message_thread_id } : {},
+      ),
+    editMessageText: async (chatId, messageId, text) =>
+      bot.api.editMessageText(chatId, messageId, text),
+    sendChatAction: async (chatId, action, opts) =>
+      bot.api.sendChatAction(
+        chatId,
+        action,
+        opts?.message_thread_id != null ? { message_thread_id: opts.message_thread_id } : {},
+      ),
+  });
+}
+
 // Pending ask_user callbacks — keyed by a unique ID, resolved when the user taps a button.
 type PendingCallback = {
   resolve: (value: string) => void;
@@ -1317,7 +1372,11 @@ const mcp = new Server(
 );
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
+  tools: (IS_WORKER
+    ? // Worker role: hide topic-lifecycle tools. Master stays single source
+      // of truth for routes.json, so only it creates/edits/deletes topics.
+      (list: { name: string }[]) => list.filter((t) => !WORKER_BLOCKED_TOOLS.has(t.name))
+    : (list: { name: string }[]) => list)([
     {
       name: "reply",
       description:
@@ -1674,11 +1733,25 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         ]
       : []),
-  ],
+  ]),
 }));
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>;
+  // Defense in depth: workers should never get topic-management tool calls
+  // (they're filtered from tool-listing) but if Claude invents a call, say no.
+  if (IS_WORKER && WORKER_BLOCKED_TOOLS.has(req.params.name)) {
+    throw new Error(
+      `tool "${req.params.name}" is disabled in worker mode — ask the master to manage topics`,
+    );
+  }
+  // Worker autofill: if Claude omits chat_id (or thread_id for Forum topics),
+  // use the container's assigned defaults. Makes `reply({ text: "..." })`
+  // the simplest path inside a per-topic worker.
+  if (IS_WORKER) {
+    if (args.chat_id == null && WORKER_DEFAULT_CHAT_ID) args.chat_id = WORKER_DEFAULT_CHAT_ID;
+    if (args.thread_id == null && WORKER_DEFAULT_THREAD_ID) args.thread_id = Number(WORKER_DEFAULT_THREAD_ID);
+  }
   try {
     switch (req.params.name) {
       case "reply": {
@@ -2611,6 +2684,17 @@ function cacheMedia(uniqueId: string, path: string, transcription?: string): voi
 bot.on("message", async (ctx, next) => {
   const msg = ctx.message;
   if (msg) {
+    // Topic name capture — routing.ts uses these to derive pretty
+    // container names like worker-urlaub-t42 instead of worker-t42.
+    const threadIdAny = (msg as any).message_thread_id as number | undefined;
+    if (threadIdAny != null) {
+      const created = (msg as any).forum_topic_created as { name?: string } | undefined;
+      const edited = (msg as any).forum_topic_edited as { name?: string } | undefined;
+      const newName = created?.name ?? edited?.name;
+      if (newName) {
+        rememberTopic(String(ctx.chat.id), threadIdAny, newName);
+      }
+    }
     const from = msg.from;
     let text: string | undefined = msg.text ?? msg.caption ?? undefined;
     const mediaType = msg.photo
@@ -3147,6 +3231,39 @@ async function handleInbound(
   // action === "deliver" — first promote any buffered messages from this chat
   const chat_id = String(ctx.chat!.id);
   await promotePregateBuffer(chat_id);
+
+  // Per-topic routing: if this Forum topic is assigned to a worker
+  // (or resolveRoute auto-spawns one because it's a new topic), inject
+  // the message into the worker's tmux-hosted claude session instead of
+  // delivering to the master. Falls back to local delivery if the docker
+  // dispatch fails so messages never drop silently. DMs and the General
+  // topic have no thread_id and never route.
+  const threadId = (ctx.message as any)?.message_thread_id as number | undefined;
+  const route = await resolveRoute(chat_id, threadId);
+  if (route) {
+    const user = ctx.from?.username ?? (ctx.from ? String(ctx.from.id) : "");
+    const ok = await dispatchToWorker(route, {
+      content: inboundText,
+      meta: {
+        chat_id,
+        thread_id: threadId != null ? String(threadId) : undefined,
+        message_id: ctx.message?.message_id != null ? String(ctx.message.message_id) : undefined,
+        user,
+        user_id: ctx.from ? String(ctx.from.id) : undefined,
+        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+        route_label: route.label,
+      },
+    });
+    if (ok) {
+      process.stderr.write(
+        `telegram channel: routed ${chat_id}/topic ${threadId} → ${route.container}${route.label ? ` (${route.label})` : ""}\n`,
+      );
+      return;
+    }
+    process.stderr.write(
+      `telegram channel: routing to ${route.container} failed — falling back to local delivery\n`,
+    );
+  }
 
   await deliverMessage(ctx, inboundText, downloadMedia, result.access);
 }

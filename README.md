@@ -79,6 +79,41 @@ Drop-in upgrade for the [official Claude Code Telegram plugin](https://github.co
 | **🔒 Shell Injection Protection** | All subprocess calls use `spawnSync` with array args. No shell interpretation. |
 | **📊 Smart Caching** | Voice/audio cached between middleware and handlers. No double downloads or transcriptions. |
 
+## Dockerized multi-bot setup
+
+If you want to run several Supercharged bots side by side on one host, each
+in its own Docker container with its own `workers.*` panel, use the
+scaffolder:
+
+```sh
+scripts/new-bot.sh <bot-name> --token <telegram-bot-token>
+```
+
+This creates `../<bot-name>/` as a sibling of the fork, wires a
+`docker-compose.yml` that mounts this fork at `/opt/telegram-supercharged`,
+provisions a CF tunnel subdomain + Access policy, and brings the container
+up. To reuse an already-authenticated Claude Code session from another
+running bot, pass `--seed-from ../<other-bot>` — otherwise run
+`claude /login` inside the container once.
+
+**What the master entrypoint auto-seeds on first boot** (idempotent, never
+clobbers existing state):
+
+- `/root/.claude.json` with onboarding flags so the theme picker + trust
+  dialog don't block the supervisor TTY
+- `/root/.claude/settings.json` enabling `telegram@claude-plugins-official`
+  and `skipDangerousModePermissionPrompt`
+- `/root/.claude/channels/telegram/.env` materialised from `$TELEGRAM_BOT_TOKEN`
+  if passed via compose env
+- Telegram plugin + marketplace via `claude plugin install` if the plugins
+  directory is empty
+
+**What you still need to supply per bot:**
+
+- Telegram bot token (from BotFather, passed to `new-bot.sh`)
+- Claude Code OAuth — either via `claude /login` in the new container or
+  via `--seed-from` from an existing bot
+
 ## Getting Started
 
 > Default pairing flow for a single-user DM bot. See [ACCESS.md](./ACCESS.md) for groups and multi-user setups.
