@@ -43,7 +43,13 @@ const TOPICS_CACHE_FILE = join(STATE_DIR, "topics.json");
 const TMUX_SESSION = process.env.TELEGRAM_WORKER_TMUX_SESSION ?? "claude";
 const DISPATCH_TIMEOUT_MS = 10_000;
 const SPAWN_TIMEOUT_MS = 60_000;
-const TMUX_READY_TIMEOUT_MS = 45_000;
+// Bots that wire heavy work into WORKER_INIT_SCRIPT (apt install, npm
+// install, DB seed, …) delay the post-init `tmux new-session -d -s claude`
+// by minutes on cold boot. Keep 45s as default for vanilla workers but let
+// the compose file bump it so bringUpContainer doesn't false-negative.
+const TMUX_READY_TIMEOUT_MS = Number(
+  process.env.WORKER_TMUX_READY_TIMEOUT_MS ?? "45000",
+);
 
 const WORKER_IMAGE = process.env.WORKER_IMAGE ?? "personal-worker-test:latest";
 const WORKER_HOST_BASE_DIR = process.env.WORKER_HOST_BASE_DIR ?? "";
